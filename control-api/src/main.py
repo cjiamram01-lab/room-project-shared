@@ -1,6 +1,13 @@
+from pathlib import Path
+
 import uvicorn
+from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
+
+# Support launching through this legacy entry point as well.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 from routes.api import router as api_router
 
 app = FastAPI()

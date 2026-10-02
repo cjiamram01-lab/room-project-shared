@@ -1,11 +1,19 @@
 import asyncio
 import logging
+from pathlib import Path
+
 import uvicorn
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+
+# Load local secrets before importing routers that read environment variables.
+# Existing process-level environment variables take precedence over .env values.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from routes.api import router as api_router
 from src.endpoints.send_to_device import MQTT_BROKER_HOST, MQTT_BROKER_PORT
 from src.endpoints.mqtt_stream import on_message as stream_on_message, set_event_loop as set_stream_event_loop

@@ -6,6 +6,7 @@ import { locale } from "../i18n";
 import { useUserStore } from "../stores/user";
 
 type LoadState = "loading" | "ready" | "error";
+type ApiStatus = "checking" | "online" | "offline";
 type RoomTone = "free" | "busy" | "scheduled" | "unknown";
 type OverviewView = "calendar" | "rooms";
 
@@ -123,6 +124,11 @@ const accessories = ref<FeatureRecord[]>([]);
 const personCounts = ref(new Map<string, number>());
 const state = ref<LoadState>("loading");
 const errorMessage = ref("");
+const apiStatus = ref<ApiStatus>("checking");
+const apiStatusDetail = ref("");
+const apiCheckedAt = ref<Date | null>(null);
+const apiModalDismissed = ref(false);
+const apiRetrying = ref(false);
 const detailLoading = ref(false);
 const detailError = ref("");
 const selectedRoomCode = ref("");
@@ -151,6 +157,7 @@ const weekdays = [
 ];
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let dashboardRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let apiCheckTimer: ReturnType<typeof setInterval> | null = null;
 let personCountStream: EventSource | null = null;
 let detailRequestGeneration = 0;
 
@@ -231,6 +238,83 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function checkApiConnection() {
+  // /test/ping touches neither MySQL nor the MQTT broker, so a failure here
+  // means the API itself is unreachable rather than one of its dependencies
+  // being down — which is the difference the banner needs to report.
+  const controller = new AbortController();
+  // fetch() has no timeout of its own: without this, an unreachable server
+  // leaves the request hanging and the banner never appears.
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${API_BASE}/test/ping`, { signal: controller.signal });
+    // Only a 5xx counts as broken. Any other reply — including a 404 from an
+    // older control-api build that has no /test/ping — proves the server is
+    // reachable and answering, which is all this check is asking.
+    if (response.status >= 500) {
+      apiStatus.value = "offline";
+      apiStatusDetail.value = `เซิร์ฟเวอร์ตอบกลับรหัส ${response.status}`;
+      return false;
+    }
+    apiStatus.value = "online";
+    apiStatusDetail.value = "";
+    // Armed again, so a later outage raises the modal instead of being
+    // silently downgraded to the banner the user dismissed hours ago.
+    apiModalDismissed.value = false;
+    return true;
+  } catch (error) {
+    apiStatus.value = "offline";
+    apiStatusDetail.value = (error as Error)?.name === "AbortError"
+      ? "เซิร์ฟเวอร์ไม่ตอบสนองภายใน 5 วินาที"
+      : "ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้";
+    return false;
+  } finally {
+    clearTimeout(timeout);
+    apiCheckedAt.value = new Date();
+  }
+}
+
+async function retryConnection() {
+  if (apiRetrying.value) return;
+  // apiStatus stays "offline" for the duration so the modal does not flicker
+  // out and back in while the ping is in flight.
+  apiRetrying.value = true;
+  try {
+    if (await checkApiConnection()) {
+      await loadCoreData();
+      // The EventSource died with the server it was attached to; a fresh one is
+      // needed or live person counts stay frozen after the API comes back.
+      resubscribePersonCount();
+    }
+  } finally {
+    apiRetrying.value = false;
+  }
+}
+
+function dismissApiModal() {
+  apiModalDismissed.value = true;
+}
+
+function handleApiModalKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") dismissApiModal();
+}
+
+// Unmissable while the dashboard is untrustworthy; once dismissed it steps
+// down to the banner, so the warning never disappears entirely.
+const showApiModal = computed(() => apiStatus.value === "offline" && !apiModalDismissed.value);
+const showApiBanner = computed(() => apiStatus.value === "offline" && apiModalDismissed.value);
+const apiCheckedAtLabel = computed(() => apiCheckedAt.value
+  ? apiCheckedAt.value.toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+  : "");
+
+// The listener goes on window, not on the overlay: keydown only reaches an
+// element that has focus, and the overlay div is not focusable, so Esc bound
+// there would do nothing unless focus happened to be inside already.
+watch(showApiModal, (visible) => {
+  if (visible) window.addEventListener("keydown", handleApiModalKeydown);
+  else window.removeEventListener("keydown", handleApiModalKeydown);
+});
+
 function normalizeDashboard(payload: unknown): DashboardPayload {
   const raw = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
   return {
@@ -259,6 +343,18 @@ async function loadCoreData(showLoading = true) {
   if (roomsResult.status === "fulfilled") rooms.value = normalizeRooms(roomsResult.value);
   if (schedulesResult.status === "fulfilled") {
     schedules.value = Array.isArray(schedulesResult.value) ? schedulesResult.value as ScheduleRecord[] : [];
+  }
+
+  // Every request failing points at the API being gone, not at one endpoint
+  // misbehaving — catches a server that dies between scheduled pings.
+  const results = [dashboardResult, roomsResult, schedulesResult];
+  if (results.every((result) => result.status === "rejected")) {
+    apiStatus.value = "offline";
+    apiStatusDetail.value = "ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้";
+    apiCheckedAt.value = new Date();
+  } else if (apiStatus.value === "offline") {
+    apiStatus.value = "online";
+    apiStatusDetail.value = "";
   }
 
   if (dashboardResult.status === "rejected") {
@@ -305,6 +401,12 @@ async function loadSelectedRoomFeatures(roomCode: string) {
     detailError.value = "ไม่สามารถโหลดข้อมูลซอฟต์แวร์และอุปกรณ์ได้";
   }
   detailLoading.value = false;
+}
+
+function resubscribePersonCount() {
+  personCountStream?.close();
+  personCountStream = null;
+  subscribePersonCount();
 }
 
 function subscribePersonCount() {
@@ -795,15 +897,28 @@ watch(selectedRoomCode, (roomCode) => {
 
 onMounted(() => {
   selectToday();
+  checkApiConnection();
   loadCoreData();
   subscribePersonCount();
   clockTimer = setInterval(() => { now.value = new Date(); }, 1000);
   dashboardRefreshTimer = setInterval(() => loadCoreData(false), 5 * 60_000);
+  // Polls far more often than the 5-minute data refresh: this screen runs
+  // unattended on the kiosks, so the banner has to clear itself once the API
+  // is back without anyone being there to press retry.
+  apiCheckTimer = setInterval(async () => {
+    const wasOffline = apiStatus.value === "offline";
+    if (await checkApiConnection() && wasOffline) {
+      await loadCoreData(false);
+      resubscribePersonCount();
+    }
+  }, 30_000);
 });
 
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer);
   if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
+  if (apiCheckTimer) clearInterval(apiCheckTimer);
+  window.removeEventListener("keydown", handleApiModalKeydown);
   personCountStream?.close();
   personCountStream = null;
 });
@@ -812,6 +927,27 @@ onUnmounted(() => {
 <template>
   <div class="dashboard-test-page">
     <h1 class="sr-only">แดชบอร์ดสถานะและการใช้ห้องคอมพิวเตอร์</h1>
+
+    <div v-if="showApiBanner" class="api-offline-banner" role="alert">
+      <span class="api-offline-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 3 1.8 20.4h20.4z" />
+          <path d="M12 9.4v4.4" />
+          <path d="M12 16.9h.01" />
+        </svg>
+      </span>
+      <div class="api-offline-text">
+        <p class="api-offline-title">ไม่สามารถเชื่อมต่อกับระบบได้</p>
+        <p class="api-offline-detail">
+          {{ apiStatusDetail }}
+          <template v-if="apiCheckedAtLabel"> · ตรวจสอบล่าสุด {{ apiCheckedAtLabel }} น.</template>
+          · ข้อมูลที่แสดงอาจไม่เป็นปัจจุบัน · ติดต่อผู้ดูแลระบบ
+        </p>
+      </div>
+      <button type="button" class="api-offline-retry" :disabled="apiRetrying" @click="retryConnection">
+        {{ apiRetrying ? "กำลังเชื่อมต่อ…" : "ลองเชื่อมต่อใหม่" }}
+      </button>
+    </div>
 
     <section class="overview-grid" aria-label="ภาพรวมสถานะห้อง">
       <div class="mobile-current-time">
@@ -1378,6 +1514,52 @@ onUnmounted(() => {
   </div>
 
   <Teleport to="body">
+    <div v-if="showApiModal" class="api-error-overlay" role="presentation">
+      <section
+        class="api-error-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="api-error-title"
+        aria-describedby="api-error-detail"
+      >
+        <span class="api-error-modal-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 3 1.8 20.4h20.4z" />
+            <path d="M12 9.4v4.4" />
+            <path d="M12 16.9h.01" />
+          </svg>
+        </span>
+        <h2 id="api-error-title">ไม่สามารถเชื่อมต่อกับระบบได้</h2>
+        <p id="api-error-detail">{{ apiStatusDetail }}</p>
+        <p class="api-error-modal-note">
+          ข้อมูลที่แสดงอยู่อาจไม่เป็นปัจจุบัน ระบบจะพยายามเชื่อมต่อใหม่ทุก 30 วินาที
+          <template v-if="apiCheckedAtLabel"><br />ตรวจสอบล่าสุด {{ apiCheckedAtLabel }} น.</template>
+        </p>
+        <p class="api-error-modal-contact">
+          <span class="api-error-contact-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M4.5 5.5h4l1.6 4-2.3 1.6a11.5 11.5 0 0 0 4.9 4.9l1.6-2.3 4 1.6v4a1.5 1.5 0 0 1-1.6 1.5A15.5 15.5 0 0 1 3 7.1 1.5 1.5 0 0 1 4.5 5.5z" />
+            </svg>
+          </span>
+          ติดต่อผู้ดูแลระบบ
+        </p>
+        <div class="api-error-modal-actions">
+          <button type="button" class="api-error-modal-dismiss" @click="dismissApiModal">ปิดหน้าต่าง</button>
+          <button
+            type="button"
+            class="api-error-modal-retry"
+            autofocus
+            :disabled="apiRetrying"
+            @click="retryConnection"
+          >
+            {{ apiRetrying ? "กำลังเชื่อมต่อ…" : "ลองเชื่อมต่อใหม่" }}
+          </button>
+        </div>
+      </section>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
     <div
       v-if="loginPromptVisible"
       class="login-prompt-overlay"
@@ -1710,6 +1892,50 @@ onUnmounted(() => {
 .schedule-empty { display: flex; align-items: center; justify-content: center; flex: 1; min-height: 5rem; color: var(--dt-muted); font-size: 0.78rem; text-align: center; }
 .panel-state.error { flex-direction: column; gap: 0.5rem; color: var(--dt-red); }
 .panel-state button { border: 1px solid var(--dt-border); border-radius: 6px; padding: 0.35rem 0.6rem; background: var(--dt-surface); color: var(--dt-text); font: inherit; cursor: pointer; }
+
+/* Fixed rather than a grid child: .dashboard-test-page pins its rows to the
+   viewport height, so a banner in the flow would squeeze the panels and the
+   layout would shift every time the API blinked. */
+.api-offline-banner { position: fixed; z-index: 650; top: 0.5rem; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 0.7rem; width: min(calc(100vw - 1rem), 46rem); box-sizing: border-box; padding: 0.6rem 0.8rem; border: 1px solid var(--dt-red); border-radius: 11px; background: var(--dt-red-soft); color: var(--dt-red); box-shadow: 0 10px 30px rgb(15 23 42 / 0.2); }
+.api-offline-icon { display: grid; place-items: center; flex: none; width: 1.9rem; height: 1.9rem; border-radius: 8px; background: var(--dt-surface); }
+.api-offline-icon svg { width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.api-offline-text { min-width: 0; flex: 1 1 auto; }
+.api-offline-title { margin: 0; font-size: 0.88rem; font-weight: 750; }
+.api-offline-detail { margin: 0.1rem 0 0; color: var(--dt-text); font-size: 0.75rem; line-height: 1.45; opacity: 0.85; }
+.api-offline-retry { flex: none; min-height: 2.1rem; padding: 0 0.75rem; border: 1px solid var(--dt-red); border-radius: 8px; background: var(--dt-surface); color: var(--dt-red); font: inherit; font-size: 0.78rem; font-weight: 700; cursor: pointer; }
+.api-offline-retry:hover:not(:disabled) { background: var(--dt-red); color: var(--dt-surface); }
+.api-offline-retry:focus-visible { outline: 2px solid var(--dt-red); outline-offset: 2px; }
+.api-offline-retry:disabled { opacity: 0.6; cursor: progress; }
+
+/* z-index above .login-prompt-overlay (700): if the API is unreachable the
+   booking prompt behind it cannot lead anywhere, so this has to be on top. */
+.api-error-overlay { position: fixed; inset: 0; z-index: 800; display: grid; place-items: center; padding: 1rem; background: rgb(15 23 42 / 0.72); backdrop-filter: blur(3px); }
+.api-error-modal { width: min(100%, 27rem); box-sizing: border-box; padding: 1.8rem 1.6rem 1.5rem; border-radius: 14px; background: var(--bg-surface, #fff); color: var(--text-primary, #0f172a); box-shadow: 0 24px 70px rgb(15 23 42 / 0.36); text-align: center; }
+.api-error-modal-icon { display: grid; place-items: center; width: 3.1rem; height: 3.1rem; margin: 0 auto 0.9rem; border-radius: 12px; background: var(--status-busy-soft, #fee2e2); color: var(--status-busy-text, #b91c1c); }
+.api-error-modal-icon svg { width: 1.6rem; height: 1.6rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.api-error-modal h2 { margin: 0; font-size: 1.18rem; letter-spacing: -0.015em; }
+.api-error-modal p { margin: 0.45rem auto 0; max-width: 34ch; color: var(--text-secondary, #526174); font-size: 0.86rem; line-height: 1.55; }
+.api-error-modal-note { font-size: 0.78rem !important; opacity: 0.85; }
+.api-error-modal-contact { display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem; margin-top: 0.9rem !important; padding: 0.4rem 0.75rem; border: 1px dashed var(--border, #d7dee8); border-radius: 8px; background: var(--bg-surface-alt, #f8fafc); color: var(--text-primary, #0f172a) !important; font-size: 0.82rem !important; font-weight: 700; }
+.api-error-contact-icon { display: inline-grid; place-items: center; flex: none; color: var(--status-busy-text, #b91c1c); }
+.api-error-contact-icon svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.api-error-modal-actions { display: grid; grid-template-columns: 1fr 1.3fr; gap: 0.6rem; margin-top: 1.4rem; }
+.api-error-modal-actions button { min-height: 2.7rem; border-radius: 9px; font: inherit; font-size: 0.83rem; font-weight: 750; cursor: pointer; }
+.api-error-modal-dismiss { border: 1px solid var(--border, #d7dee8); background: var(--bg-surface, #fff); color: var(--text-secondary, #526174); }
+.api-error-modal-dismiss:hover { background: var(--bg-surface-alt, #f8fafc); color: var(--text-primary, #0f172a); }
+.api-error-modal-retry { border: 1px solid var(--status-busy-text, #b91c1c); background: var(--status-busy-text, #b91c1c); color: #fff; }
+.api-error-modal-retry:hover:not(:disabled) { background: color-mix(in srgb, var(--status-busy-text, #b91c1c) 84%, #000); }
+.api-error-modal-retry:disabled { opacity: 0.7; cursor: progress; }
+.api-error-modal-actions button:focus-visible { outline: 2px solid var(--status-busy-text, #b91c1c); outline-offset: 2px; }
+
+@media (max-width: 30rem) {
+  .api-error-modal-actions { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 36rem) {
+  .api-offline-banner { flex-wrap: wrap; row-gap: 0.5rem; }
+  .api-offline-retry { width: 100%; }
+}
 
 .room-detail-panel { min-width: 0; min-height: 0; padding: 0.62rem; overflow-y: auto; background: color-mix(in srgb, var(--dt-blue-soft) 20%, var(--dt-surface)); scrollbar-width: thin; }
 .room-detail-dialog { width: min(92vw, 42rem); max-width: none; max-height: min(90dvh, 48rem); padding: 0; overflow: hidden; border: 1px solid var(--dt-border); border-radius: 14px; background: var(--dt-surface); color: var(--dt-text); box-shadow: 0 24px 70px rgb(15 23 42 / 0.34); }

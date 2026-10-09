@@ -1,0 +1,13 @@
+{
+  "url": "rtsp://USER:PASSWORD@10.100.197.21:554/",
+  "room_no": "27.01.01",
+  "host": "192.168.16.112",
+  "api_base": "http://localhost:8000",
+  "rtsp_user": "USER",
+  "rtsp_password": "PASSWORD",
+  "rtsp_port": 554,
+  "rtsp_path": "/",
+  "mqtt_host": "10.27.127.25",
+  "mqtt_port": 1883,
+  "mqtt_topic": "camera/person-count"
+}

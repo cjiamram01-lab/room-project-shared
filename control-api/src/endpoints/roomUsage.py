@@ -220,3 +220,10 @@ async def delete_room_usage_by_admin(id: int):
     if not result:
         raise HTTPException(status_code=400, detail="Failed to delete room usage")
     return {"message": "Room usage deleted successfully"}
+
+
+@router.get("get_current_usage")
+async  def get_current_usage():    
+    db=RoomUsage_Controller()
+    results=db.get_current_usage()
+    return results 

@@ -65,6 +65,39 @@ class RoomUsage_Controller():
         result = db.set_specific_sql(sql, (usage_status,usage_status,id))
         del db
         return result
+    def get_current_usage(self):
+        db=DB()
+        sql=f"""SELECT 
+                V.roomcode, 
+                V.scheduleDate,
+                V.startTime,
+                V.finishTime,
+                I.ip_address
+        FROM (
+            SELECT roomcode,
+                schedule_date AS scheduleDate,
+                startTime,
+                finishTime
+            FROM schedules
+            WHERE schedule_date = CURDATE()
+            AND CURTIME() >= STR_TO_DATE(startTime,  '%H:%i')
+            AND CURTIME() <  STR_TO_DATE(finishTime, '%H:%i')
+
+            UNION ALL
+
+            SELECT room_no    AS roomcode,
+                booking_date AS scheduleDate,
+                start_time AS startTime,
+                finish_time AS finishTime
+            FROM room_usages
+            WHERE booking_date = CURDATE()
+            AND CURTIME() >= CAST(start_time  AS TIME)
+            AND CURTIME() <  CAST(finish_time AS TIME)
+        ) AS V
+        INNER JOIN ip_binding I ON V.roomcode = I.room_no;"""
+        results=db.get_specific_sql(sql)
+        del db
+        return results 
     
     def get_schedule_wait_aprove(self):
         db=DB()

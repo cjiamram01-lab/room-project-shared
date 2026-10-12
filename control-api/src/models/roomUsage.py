@@ -65,6 +65,7 @@ class RoomUsage_Controller():
         result = db.set_specific_sql(sql, (usage_status,usage_status,id))
         del db
         return result
+    
     def get_current_usage(self):
         db=DB()
         sql=f"""SELECT 

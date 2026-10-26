@@ -51,6 +51,18 @@ import paho.mqtt.client as mqtt
 import requests
 from ultralytics import YOLO
 
+from cctv_common import (
+    DetectionParams,
+    build_rtsp_url,
+    detect,
+    detect_tiled,
+    draw_annotations,
+    load_config,
+    load_model,
+    mask_url,
+    resolve_device,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -69,18 +81,17 @@ DEFAULT_API_BASE = "http://localhost:8000"
 # --usage-path once that slash is added upstream.
 DEFAULT_USAGE_PATH = "/room-usageget_current_usage"
 DEFAULT_LOG_PATH = "/counter_controller/add/"
-DEFAULT_MQTT_HOST = "10.27.127.25"
+DEFAULT_MQTT_HOST = "cosai.nrru.ac.th"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_TOPIC = "camera/person-count"
 
 
 @dataclass(frozen=True)
-class DetectionParams:
-    """Parameters controlling YOLO person detection sensitivity."""
+class Sample:
+    """What one camera gave us this cycle: a count and the frame behind it."""
 
-    confidence: float = 0.5  # minimum detection confidence to keep a box
-    iou: float = 0.45        # IoU threshold used for NMS
-    imgsz: int = 640         # inference resolution; raise it for distant people
+    count: int
+    frame: object  # the frame that produced the median count
 
 
 @dataclass(frozen=True)
@@ -89,89 +100,6 @@ class Camera:
 
     ip_address: str
     room_no: str | None
-
-
-def load_config(config_path: Path) -> dict:
-    """Load config.json, returning {} (and logging) if missing or invalid."""
-    if not config_path.is_file():
-        logger.warning("Config file not found: %s — proceeding without it", config_path)
-        return {}
-
-    try:
-        return json.loads(config_path.read_text())
-    except json.JSONDecodeError as exc:
-        logger.warning("Could not parse config file %s (%s) — proceeding without it", config_path, exc)
-        return {}
-
-
-def resolve_weights(weights: str) -> str:
-    """Prefer a copy already sitting next to the webcam counter, if there is one."""
-    if Path(weights).is_file():
-        return weights
-
-    shared = SHARED_WEIGHTS_DIR / weights
-    if shared.is_file():
-        logger.info("Using existing weights at %s", shared)
-        return str(shared)
-
-    return weights  # let ultralytics download it
-
-
-def load_model(weights: str) -> YOLO:
-    """Load a YOLO model, downloading pretrained weights on first use."""
-    try:
-        return YOLO(resolve_weights(weights))
-    except Exception as exc:  # ultralytics raises plain Exception on bad weights
-        raise RuntimeError(f"Failed to load YOLO model '{weights}': {exc}") from exc
-
-
-def count_persons(frame, model: YOLO, params: DetectionParams) -> int:
-    """Number of people YOLO finds in one frame."""
-    results = model.predict(
-        frame,
-        classes=[COCO_PERSON_CLASS_ID],
-        conf=params.confidence,
-        iou=params.iou,
-        imgsz=params.imgsz,
-        verbose=False,
-    )
-    return len(results[0].boxes)
-
-
-def build_rtsp_url(ip_address: str, config: dict) -> str | None:
-    """
-    Turn an IP from the usage endpoint into a full RTSP URL.
-
-    The endpoint only knows each room's camera IP; the credentials and stream
-    path are the same across the cameras, so they come from config instead of
-    being stored per room.
-    """
-    template = config.get("rtsp_template")
-    if template:
-        return template.format(ip=ip_address)
-
-    user = os.environ.get("CAM_USER") or config.get("rtsp_user")
-    password = os.environ.get("CAM_PASSWORD") or config.get("rtsp_password")
-    if not user or not password:
-        return None
-
-    port = config.get("rtsp_port", 554)
-    path = config.get("rtsp_path", "/")
-    if not path.startswith("/"):
-        path = "/" + path
-
-    # quote() so a password containing @ / : or ? cannot break the URL apart.
-    return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{ip_address}:{port}{path}"
-
-
-def mask_url(url: str) -> str:
-    """Hide the password so a URL can go in a log line."""
-    if "@" not in url:
-        return url
-    creds, _, host = url.rpartition("@")
-    scheme, _, userinfo = creds.partition("://")
-    user = userinfo.split(":", 1)[0]
-    return f"{scheme}://{user}:****@{host}"
 
 
 def fetch_cameras(session: requests.Session, usage_url: str, timeout: float) -> list[Camera]:
@@ -209,7 +137,9 @@ def sample_count(
     samples: int = 5,
     warmup_frames: int = 5,
     open_timeout: float = 15.0,
-) -> int | None:
+    tiles: int = 1,
+    tile_overlap: float = 0.2,
+) -> Sample | None:
     """
     Open a stream, count people on several frames, and return the median.
 
@@ -217,6 +147,10 @@ def sample_count(
     often partial while the decoder waits for a keyframe, and a person caught
     mid-stride behind a monitor can be missed on any single frame. The median
     discards both kinds of outlier without needing a long observation window.
+
+    The frame that produced the median comes back with it, so the picture
+    that can be saved alongside a logged count is the one YOLO actually
+    counted — not a later frame showing a different room.
 
     Returns None if the stream never produced a usable frame.
     """
@@ -230,7 +164,7 @@ def sample_count(
 
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     deadline = time.monotonic() + open_timeout
-    counts: list[int] = []
+    taken: list[tuple[int, object]] = []
 
     try:
         for _ in range(warmup_frames):
@@ -238,9 +172,9 @@ def sample_count(
                 break
             capture.read()  # discard: decoder is still settling
 
-        while len(counts) < samples:
+        while len(taken) < samples:
             if time.monotonic() > deadline:
-                logger.warning("Timed out after %d/%d samples", len(counts), samples)
+                logger.warning("Timed out after %d/%d samples", len(taken), samples)
                 break
 
             ok, frame = capture.read()
@@ -250,13 +184,87 @@ def sample_count(
                 # flat out until the timeout.
                 time.sleep(0.1)
                 continue
-            counts.append(count_persons(frame, model, params))
+            if tiles > 1:
+                found = detect_tiled(frame, model, params, tiles, tiles, tile_overlap)
+            else:
+                found = detect(frame, model, params)
+            taken.append((len(found), frame))
     finally:
         capture.release()
 
-    if not counts:
+    if not taken:
         return None
-    return int(statistics.median(counts))
+
+    median = int(statistics.median(count for count, _ in taken))
+    # The frame whose own count matches the median: the median value itself
+    # may come from averaging two middle samples, so pick the nearest real
+    # observation rather than inventing a frame to go with it.
+    frame = min(taken, key=lambda item: abs(item[0] - median))[1]
+    return Sample(count=median, frame=frame)
+
+
+DEFAULT_CAPTURE_DIR = SCRIPT_DIR / "captures"
+
+
+def save_capture(
+    frame,
+    camera: Camera,
+    count: int,
+    capture_dir: Path,
+    annotate_with: list | None = None,
+) -> Path | None:
+    """
+    Write the counted frame to disk, filed by room and day.
+
+    The count is in the filename so a suspect number can be checked against
+    the picture it came from without opening anything.
+    """
+    stamp = datetime.now()
+    folder = capture_dir / (camera.room_no or "unknown") / stamp.strftime("%Y-%m-%d")
+    name = f"{stamp.strftime('%H%M%S')}_{camera.ip_address}_{count}.jpg"
+
+    image = draw_annotations(frame, annotate_with, f"Count: {count}") if annotate_with is not None else frame
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        if not cv2.imwrite(str(path), image):
+            logger.warning("Could not write capture %s", path)
+            return None
+        return path
+    except OSError as exc:
+        # A full or unwritable disk must not stop the counts being logged.
+        logger.warning("Could not save capture for %s: %s", camera.ip_address, exc)
+        return None
+
+
+def prune_captures(capture_dir: Path, keep_hours: float) -> int:
+    """
+    Delete captures older than keep_hours.
+
+    Seven cameras every five minutes is roughly 2,000 JPEGs and 600MB a day,
+    so without this the disk fills in about a week.
+    """
+    if keep_hours <= 0 or not capture_dir.is_dir():
+        return 0
+
+    cutoff = time.time() - keep_hours * 3600
+    removed = 0
+    try:
+        for path in capture_dir.rglob("*.jpg"):
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                removed += 1
+        # Tidy the day folders the deletions emptied, newest-first so a day
+        # directory is only tried after its contents are gone.
+        for folder in sorted(capture_dir.rglob("*"), reverse=True):
+            if folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+    except OSError as exc:
+        logger.warning("Could not prune captures: %s", exc)
+
+    if removed:
+        logger.info("Pruned %d capture(s) older than %gh", removed, keep_hours)
+    return removed
 
 
 def post_count(
@@ -368,7 +376,7 @@ def run_cycle(
     # Stop before the next cycle is due, so a slow or unreachable camera cannot
     # push every later cycle off its 5-minute slot.
     deadline = time.monotonic() + args.cycle_budget
-    logged = failed = skipped = empty = published = 0
+    logged = failed = skipped = empty = published = captured = 0
 
     logger.info("%d camera(s) to sample", len(cameras))
     for camera in cameras:
@@ -376,6 +384,7 @@ def run_cycle(
             skipped += 1
             continue
 
+        camera_started = time.monotonic()
         url = build_rtsp_url(camera.ip_address, config)
         if url is None:
             logger.error("No camera credentials, cannot build a URL for %s", camera.ip_address)
@@ -383,11 +392,13 @@ def run_cycle(
             continue
 
         try:
-            count = sample_count(
+            sample = sample_count(
                 url, model, params,
                 samples=args.samples,
                 warmup_frames=args.warmup_frames,
                 open_timeout=args.camera_timeout,
+                tiles=args.tiles,
+                tile_overlap=args.tile_overlap,
             )
         except Exception as exc:
             # One unreachable or misbehaving camera must not end the cycle.
@@ -395,12 +406,25 @@ def run_cycle(
             failed += 1
             continue
 
-        if count is None:
+        if sample is None:
             logger.warning("room=%s %s gave no usable frame", camera.room_no, camera.ip_address)
             failed += 1
             continue
 
-        logger.info("room=%s ip=%s count=%d", camera.room_no, camera.ip_address, count)
+        count = sample.count
+        logger.info(
+            "room=%s ip=%s count=%d (%.1fs)",
+            camera.room_no, camera.ip_address, count, time.monotonic() - camera_started,
+        )
+
+        # Saved before the count goes anywhere, so a row in counter_log always
+        # has the picture behind it even if the POST or the publish fails.
+        if args.capture:
+            boxes = detect(sample.frame, model, params) if args.capture_annotated else None
+            path = save_capture(sample.frame, camera, count, args.capture_dir, boxes)
+            if path is not None:
+                captured += 1
+                logger.debug("Saved %s", path)
 
         # Published even when the room is empty, unlike the database row below:
         # a live dashboard that never hears "0" would show the last non-zero
@@ -421,7 +445,12 @@ def run_cycle(
         else:
             failed += 1
 
+    if args.capture:
+        prune_captures(args.capture_dir, args.capture_keep_hours)
+
     summary = f"Cycle done: {logged} logged, {empty} empty, {failed} failed"
+    if args.capture:
+        summary += f", {captured} captured"
     if mqtt_client is not None:
         summary += f", {published} published"
     if skipped:
@@ -510,6 +539,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"falling back to {DEFAULT_MQTT_TOPIC}; room_no is sent in the JSON payload).",
     )
     parser.add_argument(
+        "--tiles",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Count on an NxN grid of overlapping crops as well as the whole frame "
+        "(default: 3). YOLO shrinks a 1920px frame to imgsz, which erases people a "
+        "few desks away; tiling scales each region up instead. 1 disables it.",
+    )
+    parser.add_argument(
+        "--tile-overlap",
+        type=float,
+        default=0.2,
+        help="How much neighbouring tiles overlap, so nobody is split by a seam (default: 0.2).",
+    )
+    parser.add_argument(
         "--samples",
         type=int,
         default=5,
@@ -559,6 +603,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Inference resolution (default: 640). Try 1280 when the cameras are "
         "far from the desks and small people are being missed.",
     )
+    parser.add_argument(
+        "--capture",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the counted frame as a JPEG (default: on).",
+    )
+    parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        default=DEFAULT_CAPTURE_DIR,
+        help=f"Where captures are filed, by room and day (default: {DEFAULT_CAPTURE_DIR.name}/).",
+    )
+    parser.add_argument(
+        "--capture-annotated",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw the boxes on the saved image (default: off; costs a second inference).",
+    )
+    parser.add_argument(
+        "--capture-keep-hours",
+        type=float,
+        default=48,
+        help="Delete captures older than this each cycle; 0 keeps everything (default: 48).",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Where to run YOLO: auto (GPU when available, default), cpu, cuda, "
+        "or a GPU index such as 0.",
+    )
+    parser.add_argument(
+        "--half",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="FP16 inference (default: on for CUDA, off for CPU, where it is not supported).",
+    )
 
     args = parser.parse_args(argv)
     if args.cycle_budget is None:
@@ -582,8 +662,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    device = resolve_device(args.device)
+    # FP16 is a CUDA feature; torch raises on a half-precision CPU forward pass.
+    half = device.startswith("cuda") if args.half is None else args.half
+    if half and not device.startswith("cuda"):
+        logger.warning("--half needs a CUDA device, ignoring it on %s", device)
+        half = False
+
     try:
-        model = load_model(args.model)
+        model = load_model(args.model, device)
     except RuntimeError as exc:
         logger.error(exc)
         return 2
@@ -592,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
         confidence=args.confidence,
         iou=args.iou,
         imgsz=args.imgsz,
+        device=device,
+        half=half,
     )
 
     logger.info("Rooms in use: %s", usage_url)

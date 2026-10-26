@@ -7,7 +7,7 @@
   "rtsp_password": "PASSWORD",
   "rtsp_port": 554,
   "rtsp_path": "/",
-  "mqtt_host": "10.27.127.25",
+  "mqtt_host": "cosai.nrru.ac.th",
   "mqtt_port": 1883,
   "mqtt_topic": "camera/person-count"
 }

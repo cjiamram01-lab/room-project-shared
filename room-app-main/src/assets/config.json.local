@@ -1,8 +1,7 @@
 {
   "mqtt": {
-    
     "host_0": "192.168.1.174",
-    "host_1":" 192.168.1.43",
+    "host_1": " 192.168.1.43",
     "host": "10.27.127.25",
     "port": 9001,
     "protocol": "ws",
@@ -22,5 +21,6 @@
   "bookingUrl": "http://localhost:5173/room-manager/",
   "staffAccessUrl": "http://localhost:5173/room-manager/staff-access/",
   "prefixUrl": "http://localhost:5173/room-manager/confirm/",
-  "apiRoute":"http://localhost:8000/"
+  "apiRoute": "http://localhost:8000/",
+  "counterApiRoute": "https://altosnrru.nrru.ac.th/counter-api"
 }

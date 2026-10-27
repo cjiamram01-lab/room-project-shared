@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,7 +19,15 @@ from urllib.parse import quote
 
 # Force TCP: more stable than UDP on a busy network. FFmpeg reads this when
 # VideoCapture opens, so it only has to be set before the first connection.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+#
+# stimeout caps the RTSP socket wait (microseconds). Without it FFmpeg blocks
+# for its own much longer default on an address that is not answering, so a
+# request for a dead camera hangs instead of failing — and an HTTP caller sees
+# a timeout rather than the 502 the code is ready to return.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000",
+)
 
 import cv2
 
@@ -357,6 +366,23 @@ def build_rtsp_url(ip_address: str, config: dict) -> str | None:
 
     # quote() so a password containing @ / : or ? cannot break the URL apart.
     return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{ip_address}:{port}{path}"
+
+
+def camera_reachable(ip_address: str, config: dict, timeout: float = 2.0) -> bool:
+    """
+    Is anything listening on the camera's RTSP port?
+
+    A plain TCP probe, because FFmpeg's own give-up on an address that does
+    not answer is tens of seconds — long enough that a caller times out before
+    the 502 arrives, and long enough to pin a stream slot while it waits.
+    Two seconds here turns that into an immediate, accurate failure.
+    """
+    port = int(config.get("rtsp_port", 554))
+    try:
+        with socket.create_connection((ip_address, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def mask_url(url: str) -> str:

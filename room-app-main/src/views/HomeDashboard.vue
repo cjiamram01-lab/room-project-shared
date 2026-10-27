@@ -113,6 +113,29 @@ interface PersonCountEvent {
 }
 
 const API_BASE = (config.apiRoute ?? "http://localhost:8000/").replace(/\/$/, "");
+// The camera relay is its own service (it carries YOLO and torch), so it has
+// its own base URL rather than hanging off the booking API.
+const CAMERA_API_BASE = (config.counterApiRoute ?? "https://altosnrru.nrru.ac.th/counter-api").replace(/\/$/, "");
+const CAMERA_FPS = 5;
+// Stop just short of the relay's own 600s cap. Reaching that cap server-side
+// is worse than stopping early: the relay drops the stream without telling
+// the browser, so the <img> simply freezes on its last frame and keeps
+// looking live. Pausing on our own clock means we know the picture is stale.
+const CAMERA_SESSION_SECONDS = 540;
+// Tiled detection: the relay cuts the 1920x1080 grab into a 3x3 grid with a
+// 20% overlap and runs YOLO on each tile, which finds the small, distant
+// people that a single downscaled pass misses. warmup discards the first
+// frames, which arrive before the stream has a keyframe to decode against.
+const CAMERA_COUNT_TILES = 3;
+const CAMERA_COUNT_OVERLAP = 0.2;
+const CAMERA_COUNT_WARMUP = 5;
+// Each snapshot opens its own RTSP connection, grabs frames and runs nine
+// detections, so it answers in seconds rather than milliseconds.
+const CAMERA_COUNT_TIMEOUT_MS = 30_000;
+// The relay serves four concurrent streams and a snapshot takes one of those
+// slots. Two leaves room for someone watching a live camera while the
+// dashboard is still counting.
+const CAMERA_COUNT_CONCURRENCY = 2;
 const router = useRouter();
 const userStore = useUserStore();
 const showBooking = inject<(startTime?: string, finishTime?: string, roomCode?: string, bookingDate?: string) => void>("showBooking");
@@ -122,6 +145,20 @@ const schedules = ref<ScheduleRecord[]>([]);
 const applications = ref<FeatureRecord[]>([]);
 const accessories = ref<FeatureRecord[]>([]);
 const personCounts = ref(new Map<string, number>());
+// roomcode -> every camera IP bound to it; a room can have more than one.
+const roomCameras = ref(new Map<string, string[]>());
+// Rooms that have reported over MQTT since the page opened. Nothing the
+// load-time lookups return is newer than a live event, so these are never
+// overwritten by them. Not a ref: it gates writes, it is never rendered.
+const liveCountRooms = new Set<string>();
+const cameraRoom = ref("");
+const cameraIndex = ref(0);
+const cameraFailed = ref(false);
+const cameraPaused = ref(false);
+const cameraSecondsLeft = ref(CAMERA_SESSION_SECONDS);
+// Bumped on every resume so the <img> key changes and the browser opens a new
+// connection instead of serving the dead one from cache.
+const cameraAttempt = ref(0);
 const state = ref<LoadState>("loading");
 const errorMessage = ref("");
 const apiStatus = ref<ApiStatus>("checking");
@@ -158,6 +195,7 @@ const weekdays = [
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let dashboardRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let apiCheckTimer: ReturnType<typeof setInterval> | null = null;
+let cameraTimer: ReturnType<typeof setInterval> | null = null;
 let personCountStream: EventSource | null = null;
 let detailRequestGeneration = 0;
 
@@ -403,6 +441,225 @@ async function loadSelectedRoomFeatures(roomCode: string) {
   detailLoading.value = false;
 }
 
+async function loadRoomCameras() {
+  try {
+    const rows = await fetchJson<{ room_no: string; ip_address: string }[]>(
+      `${API_BASE}/camera-stream/cameras`,
+    );
+    const next = new Map<string, string[]>();
+    for (const row of rows ?? []) {
+      if (!row?.room_no || !row?.ip_address) continue;
+      const list = next.get(row.room_no) ?? [];
+      list.push(row.ip_address);
+      next.set(row.room_no, list);
+    }
+    roomCameras.value = next;
+  } catch {
+    // No camera list means no camera buttons, which is the right fallback:
+    // the rest of the dashboard does not depend on this.
+    roomCameras.value = new Map();
+  }
+}
+
+// A room can have several cameras. Taking the highest rather than the sum
+// avoids counting the same person twice where two cameras overlap; it can
+// undercount a room whose cameras cover different halves.
+function bestPerRoom(
+  results: { roomcode: string; count: number | undefined }[],
+  into = new Map<string, number>(),
+) {
+  for (const { roomcode, count } of results) {
+    if (typeof count !== "number") continue;
+    const current = into.get(roomcode);
+    into.set(roomcode, current === undefined ? count : Math.max(current, count));
+  }
+  return into;
+}
+
+function applyCounts(counts: Map<string, number>) {
+  const next = new Map(personCounts.value);
+  let changed = false;
+  for (const [roomcode, count] of counts) {
+    if (liveCountRooms.has(roomcode)) continue;
+    if (next.get(roomcode) === count) continue;
+    next.set(roomcode, count);
+    changed = true;
+  }
+  if (changed) personCounts.value = next;
+}
+
+async function loadInitialCounts() {
+  // Seeded from the database on load, because personCounts is otherwise empty
+  // until the next MQTT event arrives — which for a quiet room could be a long
+  // time, leaving the card blank when a count is already on record. This is the
+  // fast pass: it answers in milliseconds, so no card sits blank while
+  // refreshCountsFromCameras works through the cameras.
+  const entries = [...roomCameras.value.entries()];
+  if (!entries.length) return;
+
+  const lookups = entries.flatMap(([roomcode, ips]) =>
+    ips.map(async (ip) => ({
+      roomcode,
+      // 404 means that camera has never reported; anything else is a real count.
+      count: await fetchJson<{ count: number }>(
+        `${API_BASE}/counter_controller/get_last_count_by_ip/${encodeURIComponent(ip)}`,
+      ).then((body) => body?.count).catch(() => undefined),
+    })),
+  );
+
+  const settled = await Promise.allSettled(lookups);
+  applyCounts(bestPerRoom(
+    settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : [])),
+  ));
+}
+
+async function fetchCameraCount(ip: string): Promise<number | undefined> {
+  const controller = new AbortController();
+  // fetch() has no timeout of its own, so a camera that accepts the connection
+  // and then goes quiet would hold one of the two workers for the rest of the
+  // session and stall every camera queued behind it.
+  const timeout = setTimeout(() => controller.abort(), CAMERA_COUNT_TIMEOUT_MS);
+  try {
+    const url = `${CAMERA_API_BASE}/count/camera/${encodeURIComponent(ip)}`
+      + `?tiles=${CAMERA_COUNT_TILES}&overlap=${CAMERA_COUNT_OVERLAP}&warmup=${CAMERA_COUNT_WARMUP}`;
+    const response = await fetch(url, { signal: controller.signal });
+    // 502 is a camera that is not answering, 429 the relay out of stream slots.
+    // Both leave the database seed on screen, which is better than blanking a
+    // card because one camera happens to be down.
+    if (!response.ok) return undefined;
+    const body = await response.json() as { count?: number };
+    return typeof body?.count === "number" ? body.count : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshCountsFromCameras() {
+  // The database seed is only as fresh as the last scheduled sweep, which runs
+  // every five minutes. This asks the cameras themselves, so the first screen
+  // shows each room as it is right now.
+  const jobs = [...roomCameras.value.entries()].flatMap(([roomcode, ips]) =>
+    ips.map((ip) => ({ roomcode, ip })),
+  );
+  if (!jobs.length) return;
+
+  const best = new Map<string, number>();
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(CAMERA_COUNT_CONCURRENCY, jobs.length) },
+    async () => {
+      while (cursor < jobs.length) {
+        const job = jobs[cursor++];
+        const count = await fetchCameraCount(job.ip);
+        if (count === undefined) continue;
+        // Painted as each camera lands rather than all at the end, so the
+        // screen fills in instead of waiting on the slowest camera.
+        applyCounts(bestPerRoom([{ roomcode: job.roomcode, count }], best));
+      }
+    },
+  );
+  await Promise.all(workers);
+}
+
+function camerasFor(roomcode: string): string[] {
+  return roomCameras.value.get(roomcode) ?? [];
+}
+
+const cameraIps = computed(() => camerasFor(cameraRoom.value));
+const cameraStreamUrl = computed(() => {
+  const ip = cameraIps.value[cameraIndex.value];
+  if (!ip) return "";
+  return `${CAMERA_API_BASE}/raw/${encodeURIComponent(ip)}?fps=${CAMERA_FPS}&t=${cameraAttempt.value}`;
+});
+const cameraLive = computed(() => Boolean(cameraRoom.value) && !cameraPaused.value && !cameraFailed.value);
+const cameraCountdownLabel = computed(() => {
+  const total = Math.max(0, cameraSecondsLeft.value);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+});
+
+function startCameraSession() {
+  cameraSecondsLeft.value = CAMERA_SESSION_SECONDS;
+  if (cameraTimer) clearInterval(cameraTimer);
+  cameraTimer = setInterval(() => {
+    cameraSecondsLeft.value -= 1;
+    if (cameraSecondsLeft.value <= 0) pauseCamera();
+  }, 1000);
+}
+
+function stopCameraSession() {
+  if (cameraTimer) clearInterval(cameraTimer);
+  cameraTimer = null;
+}
+
+function pauseCamera() {
+  // Pausing unmounts the <img>, which is what actually closes the MJPEG
+  // connection and hands the slot back. Leaving it mounted would keep the
+  // relay's budget spent on a picture nobody is watching.
+  stopCameraSession();
+  cameraPaused.value = true;
+}
+
+function resumeCamera() {
+  cameraPaused.value = false;
+  cameraFailed.value = false;
+  cameraAttempt.value += 1;
+  startCameraSession();
+}
+
+function openCamera(roomcode: string, index = 0) {
+  cameraRoom.value = roomcode;
+  cameraIndex.value = index;
+  cameraFailed.value = false;
+  cameraPaused.value = false;
+  cameraAttempt.value += 1;
+  startCameraSession();
+}
+
+function closeCamera() {
+  // Clearing the room unmounts the <img>, which is what actually drops the
+  // MJPEG connection. The relay allows only a handful of concurrent streams,
+  // so a modal left holding one would lock other viewers out.
+  stopCameraSession();
+  cameraRoom.value = "";
+  cameraIndex.value = 0;
+  cameraFailed.value = false;
+  cameraPaused.value = false;
+}
+
+function selectCamera(index: number) {
+  cameraIndex.value = index;
+  cameraFailed.value = false;
+  cameraPaused.value = false;
+  cameraAttempt.value += 1;
+  startCameraSession();
+}
+
+function handleCameraError() {
+  // The stream is already gone, so the countdown has nothing left to protect.
+  stopCameraSession();
+  cameraFailed.value = true;
+}
+
+function handleCameraVisibility() {
+  // A hidden tab keeps its MJPEG connection open and its slot spent, and it
+  // is the common way a stream is abandoned without being closed — a switched
+  // tab, a locked screen. Release it and let the viewer resume on return.
+  if (document.hidden && cameraRoom.value && !cameraPaused.value) pauseCamera();
+}
+
+function handleCameraKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") closeCamera();
+}
+
+// Bound on window rather than the overlay: keydown only reaches a focused
+// element, and the overlay div is not focusable.
+watch(cameraRoom, (room) => {
+  if (room) window.addEventListener("keydown", handleCameraKeydown);
+  else window.removeEventListener("keydown", handleCameraKeydown);
+});
+
 function resubscribePersonCount() {
   personCountStream?.close();
   personCountStream = null;
@@ -416,6 +673,7 @@ function subscribePersonCount() {
     try {
       const payload = JSON.parse(event.data) as PersonCountEvent;
       if (payload.kind !== "person_count" || !payload.room_no || typeof payload.count !== "number") return;
+      liveCountRooms.add(payload.room_no);
       const next = new Map(personCounts.value);
       next.set(payload.room_no, payload.count);
       personCounts.value = next;
@@ -899,6 +1157,12 @@ onMounted(() => {
   selectToday();
   checkApiConnection();
   loadCoreData();
+  // Counts need the camera list first: the API keys them by IP, the dashboard
+  // by roomcode, and only this mapping joins the two.
+  loadRoomCameras()
+    .then(loadInitialCounts)
+    .then(refreshCountsFromCameras);
+  document.addEventListener("visibilitychange", handleCameraVisibility);
   subscribePersonCount();
   clockTimer = setInterval(() => { now.value = new Date(); }, 1000);
   dashboardRefreshTimer = setInterval(() => loadCoreData(false), 5 * 60_000);
@@ -919,6 +1183,9 @@ onUnmounted(() => {
   if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
   if (apiCheckTimer) clearInterval(apiCheckTimer);
   window.removeEventListener("keydown", handleApiModalKeydown);
+  window.removeEventListener("keydown", handleCameraKeydown);
+  document.removeEventListener("visibilitychange", handleCameraVisibility);
+  stopCameraSession();
   personCountStream?.close();
   personCountStream = null;
 });
@@ -1202,6 +1469,18 @@ onUnmounted(() => {
                     <span v-if="personCount(room.roomcode) !== undefined" class="people-count">
                       ตรวจพบ {{ personCount(room.roomcode) }} คน
                     </span>
+                    <button
+                      v-if="camerasFor(room.roomcode).length"
+                      type="button"
+                      class="camera-button card-camera-button"
+                      :aria-label="`ดูภาพกล้องวงจรปิดห้อง ${room.roomcode}`"
+                      @click.stop="openCamera(room.roomcode)"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3 7.5h11.5v9H3zM14.5 11l6-3v8l-6-3z" />
+                      </svg>
+                      ดูกล้อง
+                    </button>
                   </div>
                   <div v-if="room.tone === 'free'" class="room-card-actions">
                     <button
@@ -1405,6 +1684,18 @@ onUnmounted(() => {
               <p>{{ selectedRoom?.room_type || "ไม่มีข้อมูลประเภทห้อง" }}</p>
             </div>
             <div class="detail-heading-actions">
+              <button
+                v-if="camerasFor(selectedRoomCode).length"
+                type="button"
+                class="camera-button"
+                :aria-label="`ดูภาพกล้องวงจรปิดห้อง ${selectedRoomCode}`"
+                @click="openCamera(selectedRoomCode)"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 7.5h11.5v9H3zM14.5 11l6-3v8l-6-3z" />
+                </svg>
+                ดูกล้อง
+              </button>
               <span class="status-badge" :class="`tone-${selectedRoomStatus.tone}`">
                 <i aria-hidden="true" />{{ selectedRoomStatus.label }}
               </span>
@@ -1512,6 +1803,73 @@ onUnmounted(() => {
       </section>
     </dialog>
   </div>
+
+  <Teleport to="body">
+    <div
+      v-if="cameraRoom"
+      class="camera-overlay"
+      role="presentation"
+      @click.self="closeCamera"
+    >
+      <section class="camera-modal" role="dialog" aria-modal="true" aria-labelledby="camera-modal-title">
+        <header class="camera-modal-header">
+          <div>
+            <h2 id="camera-modal-title">กล้องห้อง {{ cameraRoom }}</h2>
+            <p>
+              {{ cameraIps[cameraIndex] }} &middot; {{ CAMERA_FPS }} fps
+              <template v-if="cameraLive"> &middot; เหลือเวลา {{ cameraCountdownLabel }}</template>
+            </p>
+          </div>
+          <button type="button" class="camera-modal-close" aria-label="ปิดภาพกล้อง" autofocus @click="closeCamera">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
+        </header>
+
+        <div class="camera-stage">
+          <!-- v-if, not :src="": removing the element is what actually closes
+               the MJPEG connection and frees a slot on the relay. -->
+          <img
+            v-if="cameraLive && cameraStreamUrl"
+            :key="cameraStreamUrl"
+            :src="cameraStreamUrl"
+            :alt="`ภาพสดจากกล้องห้อง ${cameraRoom}`"
+            @error="handleCameraError"
+          >
+          <div v-else-if="cameraPaused" class="camera-paused">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" /><path d="M10 9v6M14 9v6" />
+            </svg>
+            <p>หยุดแสดงภาพชั่วคราว</p>
+            <p class="camera-paused-hint">
+              ระบบหยุดสตรีมอัตโนมัติเพื่อให้ผู้อื่นใช้กล้องได้ กดเพื่อดูต่อ
+            </p>
+            <button type="button" autofocus @click="resumeCamera">ดูต่อ</button>
+          </div>
+          <div v-else class="camera-error">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3 1.8 20.4h20.4z" /><path d="M12 9.4v4.4" /><path d="M12 16.9h.01" />
+            </svg>
+            <p>ไม่สามารถแสดงภาพจากกล้องได้</p>
+            <p class="camera-error-hint">กล้องอาจออฟไลน์ หรือมีผู้ชมพร้อมกันเกินจำนวนที่รองรับ</p>
+            <button type="button" @click="resumeCamera">ลองใหม่</button>
+          </div>
+        </div>
+
+        <div v-if="cameraIps.length > 1" class="camera-switcher" role="group" aria-label="เลือกกล้อง">
+          <button
+            v-for="(ip, index) in cameraIps"
+            :key="ip"
+            type="button"
+            :class="{ selected: index === cameraIndex }"
+            :aria-pressed="index === cameraIndex"
+            @click="selectCamera(index)"
+          >
+            กล้อง {{ index + 1 }}
+          </button>
+        </div>
+      </section>
+    </div>
+  </Teleport>
 
   <Teleport to="body">
     <div v-if="showApiModal" class="api-error-overlay" role="presentation">
@@ -1906,6 +2264,42 @@ onUnmounted(() => {
 .api-offline-retry:hover:not(:disabled) { background: var(--dt-red); color: var(--dt-surface); }
 .api-offline-retry:focus-visible { outline: 2px solid var(--dt-red); outline-offset: 2px; }
 .api-offline-retry:disabled { opacity: 0.6; cursor: progress; }
+
+.camera-button { display: inline-flex; align-items: center; gap: 0.35rem; min-height: 1.95rem; padding: 0 0.6rem; border: 1px solid var(--dt-border); border-radius: 999px; background: var(--dt-surface); color: var(--dt-text); font: inherit; font-size: 0.76rem; font-weight: 700; cursor: pointer; }
+.camera-button:hover { border-color: var(--dt-blue); background: var(--dt-blue-soft); color: var(--dt-blue); }
+.camera-button:focus-visible { outline: 2px solid var(--dt-blue); outline-offset: 2px; }
+.camera-button svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* On a card the button sits in a tight stack of text lines, so it shrinks to
+   its content instead of stretching across the column. */
+.card-camera-button { align-self: flex-start; margin-top: 0.3rem; min-height: 1.65rem; padding: 0 0.5rem; font-size: 0.7rem; }
+
+/* Below the API-offline modal (800): if the API is down the stream is moot. */
+.camera-overlay { position: fixed; inset: 0; z-index: 750; display: grid; place-items: center; padding: 1rem; background: rgb(15 23 42 / 0.74); backdrop-filter: blur(3px); }
+.camera-modal { display: flex; flex-direction: column; gap: 0.7rem; width: min(100%, 60rem); max-height: 92dvh; box-sizing: border-box; padding: 0.9rem; border-radius: 14px; background: var(--bg-surface, #fff); color: var(--text-primary, #0f172a); box-shadow: 0 24px 70px rgb(15 23 42 / 0.4); }
+.camera-modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+.camera-modal-header h2 { margin: 0; font-size: 1.02rem; letter-spacing: -0.01em; }
+.camera-modal-header p { margin: 0.12rem 0 0; color: var(--text-secondary, #526174); font-size: 0.76rem; }
+.camera-modal-close { display: grid; place-items: center; flex: none; width: 2rem; height: 2rem; padding: 0; border: 1px solid var(--border, #d7dee8); border-radius: 50%; background: transparent; color: var(--text-secondary, #526174); cursor: pointer; }
+.camera-modal-close:hover { background: var(--bg-surface-alt, #f8fafc); color: var(--text-primary, #0f172a); }
+.camera-modal-close svg { width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; }
+.camera-stage { display: grid; place-items: center; min-height: 14rem; border-radius: 10px; background: #0b1220; overflow: hidden; }
+.camera-stage img { display: block; width: 100%; height: auto; max-height: 72dvh; object-fit: contain; }
+.camera-error { display: grid; justify-items: center; gap: 0.3rem; padding: 2rem 1rem; color: #e2e8f0; text-align: center; }
+.camera-error svg { width: 2rem; height: 2rem; fill: none; stroke: var(--status-busy-text, #f87171); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.camera-error p { margin: 0; font-size: 0.86rem; }
+.camera-error-hint { opacity: 0.7; font-size: 0.76rem !important; }
+.camera-error button { margin-top: 0.6rem; min-height: 2.2rem; padding: 0 0.9rem; border: 1px solid #475569; border-radius: 8px; background: transparent; color: #e2e8f0; font: inherit; font-size: 0.8rem; cursor: pointer; }
+.camera-error button:hover { background: #1e293b; }
+.camera-paused { display: grid; justify-items: center; gap: 0.3rem; padding: 2rem 1rem; color: #e2e8f0; text-align: center; }
+.camera-paused svg { width: 2rem; height: 2rem; fill: none; stroke: #94a3b8; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.camera-paused p { margin: 0; font-size: 0.86rem; }
+.camera-paused-hint { max-width: 30ch; opacity: 0.7; font-size: 0.76rem !important; }
+.camera-paused button { margin-top: 0.7rem; min-height: 2.3rem; padding: 0 1.1rem; border: 1px solid var(--dashboard-accent, #2563eb); border-radius: 8px; background: var(--dashboard-accent, #2563eb); color: #fff; font: inherit; font-size: 0.82rem; font-weight: 750; cursor: pointer; }
+.camera-paused button:hover { background: color-mix(in srgb, var(--dashboard-accent, #2563eb) 84%, #000); }
+
+.camera-switcher { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.camera-switcher button { min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--border, #d7dee8); border-radius: 8px; background: var(--bg-surface, #fff); color: var(--text-secondary, #526174); font: inherit; font-size: 0.78rem; font-weight: 700; cursor: pointer; }
+.camera-switcher button.selected { border-color: var(--dashboard-accent, #2563eb); background: var(--dashboard-accent-soft, #dbeafe); color: var(--dashboard-accent, #2563eb); }
 
 /* z-index above .login-prompt-overlay (700): if the API is unreachable the
    booking prompt behind it cannot lead anywhere, so this has to be on top. */

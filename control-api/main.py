@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 import uvicorn
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 
@@ -18,29 +19,37 @@ from routes.api import router as api_router
 from src.endpoints.send_to_device import MQTT_BROKER_HOST, MQTT_BROKER_PORT
 from src.endpoints.mqtt_stream import on_message as stream_on_message, set_event_loop as set_stream_event_loop
 
+# Path prefix this API is mounted under by the reverse proxy. Apache strips it
+# before forwarding, so routes stay declared without it; root_path only tells
+# FastAPI how to build the docs/openapi links the browser has to call back.
+# Set ROOT_PATH= (empty) to serve the API from the host root again.
+ROOT_PATH = os.getenv("ROOT_PATH", "/control-api").rstrip("/")
+
 app = FastAPI(docs_url=None, redoc_url=None)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html():
+async def custom_swagger_ui_html(request: Request):
+    prefix = request.scope.get("root_path", "").rstrip("/")
     return get_swagger_ui_html(
-        openapi_url=fastapi_app.openapi_url,
+        openapi_url=f"{prefix}{fastapi_app.openapi_url}",
         title=f"{fastapi_app.title} - Swagger UI",
-        swagger_js_url="/static/swagger-ui-bundle.js",
-        swagger_css_url="/static/swagger-ui.css",
-        swagger_favicon_url="/static/favicon.png",
+        swagger_js_url=f"{prefix}/static/swagger-ui-bundle.js",
+        swagger_css_url=f"{prefix}/static/swagger-ui.css",
+        swagger_favicon_url=f"{prefix}/static/favicon.png",
     )
 
 
 @app.get("/redoc", include_in_schema=False)
-async def custom_redoc_html():
+async def custom_redoc_html(request: Request):
+    prefix = request.scope.get("root_path", "").rstrip("/")
     return get_redoc_html(
-        openapi_url=fastapi_app.openapi_url,
+        openapi_url=f"{prefix}{fastapi_app.openapi_url}",
         title=f"{fastapi_app.title} - ReDoc",
-        redoc_js_url="/static/redoc.standalone.js",
-        redoc_favicon_url="/static/favicon.png",
+        redoc_js_url=f"{prefix}/static/redoc.standalone.js",
+        redoc_favicon_url=f"{prefix}/static/favicon.png",
     )
 
 STREAM_TOPICS = [

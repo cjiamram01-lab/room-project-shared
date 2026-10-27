@@ -97,6 +97,25 @@ class CounterLog_Controller():
         del db
         return results[0] if results else None
 
+    def get_last_count_by_ip(self, ip_address: str):
+        """
+        Just the latest count for one camera, as an int, or None if it has
+        never reported.
+
+        id DESC breaks the tie: log_date is only second-accurate, so two rows
+        written in the same second would otherwise come back in whichever
+        order MySQL happened to pick.
+        """
+        db = DB()
+        sql = """SELECT personal_count
+        FROM counter_log
+        WHERE ip_address = %s
+        ORDER BY log_date DESC, id DESC
+        LIMIT 1"""
+        results = db.get_specific_sql(sql, None, (ip_address,))
+        del db
+        return results[0]["personal_count"] if results else None
+
     def get_by_date_range(self, start_date: str, finish_date: str, ip_address: Optional[str] = None):
         """Logs between two dates inclusive, oldest first, for charting."""
         db = DB()

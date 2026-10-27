@@ -28,3 +28,17 @@ async def add_counter_log(counter_log: CounterLog_Base):
             detail=result.get("err", "Failed to add counter log"),
         )
     return {"message": "Counter log added successfully", "id": result.get("Id")}
+
+
+@router.get("/get_last_count_by_ip/{ip_address}")
+async def get_last_count_by_ip(ip_address: str):
+    """Latest count logged for one camera."""
+    db = counter_coltroller()
+    count = db.get_last_count_by_ip(ip_address)
+    # 0 is a real reading — an empty room — so only None means no data.
+    if count is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No counter log yet for ip_address '{ip_address}'",
+        )
+    return {"ip_address": ip_address, "count": count}

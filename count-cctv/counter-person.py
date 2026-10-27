@@ -44,7 +44,12 @@ from urllib.parse import quote
 
 # Force TCP: more stable than UDP on a busy network. FFmpeg reads this when
 # VideoCapture opens, so it only has to be set before the first connection.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    # stimeout caps the RTSP socket wait (microseconds), so a camera that
+    # is not answering fails fast instead of blocking the caller.
+    "rtsp_transport;tcp|stimeout;5000000",
+)
 
 import cv2
 import paho.mqtt.client as mqtt

@@ -33,3 +33,4 @@ pyttsx3
 pygame
 simpleaudio
 SpeechRecognition
+opencv-python-headless

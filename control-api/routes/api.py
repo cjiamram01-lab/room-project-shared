@@ -19,6 +19,7 @@ from src.endpoints.application  import router as application_router
 from src.endpoints.accessory  import router as accessory_router 
 from src.endpoints.schedule_AP import router as schedule_AP_router
 from src.endpoints.counter_log import router as counter_log_router
+from src.endpoints.camera_stream import router as camera_stream_router
 
 #from src.endpoints.send_mqtt import
 
@@ -27,6 +28,7 @@ from src.endpoints.counter_log import router as counter_log_router
 router = APIRouter()
 router.include_router(schedule_AP_router)
 router.include_router(counter_log_router)
+router.include_router(camera_stream_router)
 router.include_router(accessory_router)
 router.include_router(application_router)
 router.include_router(migration_router)

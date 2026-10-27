@@ -47,12 +47,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from cctv_common import (
     DetectionParams,
     build_rtsp_url,
+    camera_reachable,
     detect,
+    detect_tiled,
     draw_annotations,
     load_config,
     load_model,
@@ -245,6 +248,29 @@ app = FastAPI(
     root_path=ROOT_PATH,
 )
 
+# The dashboard lives on another host, so its fetch() calls are cross-origin.
+# An <img> stream needs no permission, but reading a JSON count does: without
+# this header the browser discards the reply before the page ever sees it.
+# Comma-separated list, or "*" for any origin.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "https://cosai.nrru.ac.th,https://altosnrru.nrru.ac.th,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    # The annotated routes report their result in this header, and a browser
+    # hides every header but a handful unless they are named here.
+    expose_headers=["X-Detection-Count"],
+)
+
 
 def params_for(
     classes: str | None,
@@ -366,6 +392,12 @@ def open_camera(ip_address: str) -> cv2.VideoCapture:
     if url is None:
         raise HTTPException(status_code=500, detail="No camera credentials configured")
 
+    # Checked before FFmpeg is handed the URL: its own timeout on a dead
+    # address outlasts the caller's.
+    if not camera_reachable(ip_address, runtime.config):
+        logger.warning("Camera %s is not answering on its RTSP port", ip_address)
+        raise HTTPException(status_code=502, detail=f"Could not connect to camera {ip_address}")
+
     capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not capture.isOpened():
         capture.release()
@@ -434,6 +466,128 @@ def mjpeg_frames(
         capture.release()
         runtime.streams.release(handle)
         logger.info("Stream %s closed for %s", handle.id, ip_address)
+
+
+def grab_still(ip_address: str, warmup: int = 5) -> "cv2.typing.MatLike":
+    """
+    Take one frame from a camera and hand the slot straight back.
+
+    Uses the same budget as the live streams, because a snapshot opens the
+    same RTSP connection; holding it for a second is fine, leaking it is not.
+    """
+    handle = runtime.streams.acquire(ip_address, "snapshot")
+    if handle is None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many live streams open (limit {MAX_CONCURRENT_STREAMS})",
+        )
+
+    try:
+        capture = open_camera(ip_address)
+    except Exception:
+        runtime.streams.release(handle)
+        raise
+
+    try:
+        # The first frames after an RTSP connect are often partial while the
+        # decoder waits for a keyframe, so a few are read and discarded.
+        frame = None
+        for _ in range(max(warmup, 1)):
+            ok, candidate = capture.read()
+            if ok:
+                frame = candidate
+    finally:
+        capture.release()
+        runtime.streams.release(handle)
+
+    if frame is None:
+        raise HTTPException(status_code=502, detail=f"Camera {ip_address} returned no usable frame")
+    return frame
+
+
+def count_frame(frame, params: DetectionParams, tiles: int, overlap: float):
+    """Run the detector, tiled or whole-frame, holding the model lock once."""
+    with runtime.lock:
+        if tiles > 1:
+            return detect_tiled(frame, runtime.model, params, tiles, tiles, overlap)
+        return detect(frame, runtime.model, params)
+
+
+@app.get("/count/camera/{ip_address}")
+def count_camera(
+    ip_address: str,
+    tiles: int = Query(3, ge=1, le=6, description="NxN grid of overlapping crops; 1 disables tiling"),
+    overlap: float = Query(0.2, ge=0.0, le=0.5, description="How much neighbouring tiles overlap"),
+    classes: str | None = Query(None, description="Names or ids, comma separated; 'all' for every class"),
+    confidence: float | None = Query(None, ge=0.0, le=1.0),
+    iou: float | None = Query(None, ge=0.0, le=1.0),
+    imgsz: int | None = Query(None, ge=32, le=4096),
+    warmup: int = Query(5, ge=1, le=30, description="Frames to discard while the decoder settles"),
+):
+    """
+    Grab a frame from a camera and count what is in it, tiled by default.
+
+    Tiling matters here more than anywhere: YOLO shrinks a 1920px frame to
+    imgsz, which erases anyone a few desks from the camera. Counting the same
+    frame again over overlapping crops scales each region up instead, and on
+    these rooms it is the difference between finding three people and thirty.
+    """
+    started = time.perf_counter()
+    params = params_for(classes, confidence, iou, imgsz)
+
+    frame = grab_still(ip_address, warmup)
+    detections = count_frame(frame, params, tiles, overlap)
+
+    height, width = frame.shape[:2]
+    return {
+        "ip_address": ip_address,
+        "count": len(detections),
+        "counts_by_class": summarise(detections),
+        "detections": [d.as_dict() for d in detections],
+        "image": {"width": width, "height": height},
+        "model": {
+            "weights": runtime.weights,
+            "device": params.device,
+            "imgsz": params.imgsz,
+            "confidence": params.confidence,
+            "tiles": tiles,
+            "overlap": overlap,
+            "classes": list(params.classes) if params.classes else "all",
+        },
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+    }
+
+
+@app.get(
+    "/count/camera/{ip_address}/annotated",
+    response_class=Response,
+    responses={200: {"content": {"image/jpeg": {}}}},
+)
+def count_camera_annotated(
+    ip_address: str,
+    tiles: int = Query(3, ge=1, le=6),
+    overlap: float = Query(0.2, ge=0.0, le=0.5),
+    classes: str | None = Query(None),
+    confidence: float | None = Query(None, ge=0.0, le=1.0),
+    iou: float | None = Query(None, ge=0.0, le=1.0),
+    imgsz: int | None = Query(None, ge=32, le=4096),
+    warmup: int = Query(5, ge=1, le=30),
+):
+    """The same count, as a JPEG with the boxes drawn — for checking it by eye."""
+    params = params_for(classes, confidence, iou, imgsz)
+    frame = grab_still(ip_address, warmup)
+    detections = count_frame(frame, params, tiles, overlap)
+
+    annotated = draw_annotations(frame, detections, f"Count: {len(detections)}")
+    ok, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode the annotated image")
+
+    return Response(
+        content=buffer.tobytes(),
+        media_type="image/jpeg",
+        headers={"X-Detection-Count": str(len(detections))},
+    )
 
 
 @app.get("/stream/{ip_address}")

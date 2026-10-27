@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import uvicorn
@@ -10,7 +11,10 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from routes.api import router as api_router
 
-app = FastAPI()
+# Same prefix as the primary entry point in ../main.py.
+ROOT_PATH = os.getenv("ROOT_PATH", "/control-api").rstrip("/")
+
+app = FastAPI(root_path=ROOT_PATH)
 
 origins = ["http://localhost:8030","http://0.0.0.0:8030"]
 

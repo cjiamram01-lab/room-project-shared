@@ -72,7 +72,9 @@ logging.basicConfig(
 logger = logging.getLogger("count-api")
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-MAX_CONCURRENT_STREAMS = 4
+# 0 means no limit, which is the default: turning a viewer away was costing
+# more than letting it through. Set a positive --max-streams to cap it again.
+MAX_CONCURRENT_STREAMS = 0
 JPEG_QUALITY = 80
 # A stream nobody closed is dropped after this long.
 #
@@ -103,6 +105,10 @@ class StreamHandle:
     kind: str
     started_at: float
     stop: threading.Event = field(default_factory=threading.Event)
+    # Opaque id for the browser tab watching this stream, so its next request
+    # can take over from this one instead of queueing behind it. Empty when
+    # the caller did not send one, which never supersedes anything.
+    viewer: str = ""
 
     @property
     def age(self) -> float:
@@ -115,17 +121,22 @@ class StreamHandle:
             "kind": self.kind,
             "age_seconds": round(self.age, 1),
             "stopping": self.stop.is_set(),
+            "viewer": self.viewer,
         }
 
 
 class StreamRegistry:
     """
-    The single owner of the concurrent-stream budget.
+    The register of open streams, and the budget when there is one.
 
     A semaphore plus a separate counter can drift apart: any path that released
     one without the other left the limit permanently wrong, invisible and
     unfixable short of a restart. One locked dict is both the budget and the
     record of who holds it, so the two cannot disagree.
+
+    limit <= 0 means no cap. The register is still kept: /streams is how a
+    stuck stream is found, and the time cap and the viewer handover both work
+    off it whether or not anything is being counted against a limit.
     """
 
     def __init__(self, limit: int, max_seconds: float = MAX_STREAM_SECONDS):
@@ -134,15 +145,52 @@ class StreamRegistry:
         self._lock = threading.Lock()
         self._handles: dict[str, StreamHandle] = {}
 
-    def acquire(self, ip_address: str, kind: str) -> StreamHandle | None:
-        """Take a slot, or None when the budget is spent."""
+    def acquire(self, ip_address: str, kind: str, viewer: str = "") -> StreamHandle | None:
+        """
+        Take a slot, or None when the budget is spent.
+
+        Returns a handle unless a limit is set and already reached.
+
+        A viewer id replaces that viewer's own earlier stream rather than
+        leaving both open. Switching between the raw and annotated views, or
+        between cameras, opens the new stream before the browser has finished
+        closing the old one, and a dropped client is only noticed when the
+        next write fails — tens of seconds later. Without this, one person
+        toggling twice would leave three streams running for one picture.
+        """
         with self._lock:
             self._reap()
-            if len(self._handles) >= self._limit:
+            if viewer:
+                self._supersede(viewer)
+            if 0 < self._limit <= len(self._handles):
                 return None
-            handle = StreamHandle(uuid4().hex[:8], ip_address, kind, time.monotonic())
+            handle = StreamHandle(uuid4().hex[:8], ip_address, kind, time.monotonic(), viewer=viewer)
             self._handles[handle.id] = handle
             return handle
+
+    @property
+    def limit(self) -> int:
+        """The configured cap; 0 when there is none."""
+        return self._limit
+
+    def _supersede(self, viewer: str) -> None:
+        """
+        Retire a viewer's earlier streams. Caller holds the lock.
+
+        The slot is handed back here rather than when the old generator
+        notices, because the replacement needs it now. The generator still
+        runs its own finally, which releases the camera and pops an id that is
+        already gone — release is idempotent precisely so this is safe.
+        """
+        for handle in list(self._handles.values()):
+            if handle.viewer != viewer:
+                continue
+            logger.info(
+                "Stream %s on %s superseded by the same viewer",
+                handle.id, handle.ip_address,
+            )
+            handle.stop.set()
+            self._handles.pop(handle.id, None)
 
     def release(self, handle: StreamHandle) -> None:
         """
@@ -154,28 +202,50 @@ class StreamRegistry:
         with self._lock:
             self._handles.pop(handle.id, None)
 
-    def close(self, stream_id: str) -> bool:
-        """Ask one stream to stop; its generator releases the slot on the way out."""
+    def close_viewer(self, viewer: str) -> int:
+        """Retire everything one viewer holds, and report how many."""
+        if not viewer:
+            return 0
         with self._lock:
-            handle = self._handles.get(stream_id)
+            held = sum(1 for h in self._handles.values() if h.viewer == viewer)
+            self._supersede(viewer)
+            return held
+
+    def close(self, stream_id: str) -> bool:
+        """
+        Stop one stream and drop it from the register straight away.
+
+        The generator still runs its own finally, which releases the camera
+        and pops an id that has already gone — release is idempotent so that
+        this is safe. Waiting for it instead would leave a stream that has
+        been closed still showing as open for as long as it takes the loop to
+        reach its next stop check, which on a tiled annotated stream is
+        seconds and on a wedged one is never.
+        """
+        with self._lock:
+            handle = self._handles.pop(stream_id, None)
             if handle is None:
                 return False
             handle.stop.set()
             return True
 
     def close_all(self) -> int:
-        """Ask every stream to stop, and report how many were asked."""
+        """Stop every stream and empty the register; reports how many there were."""
         with self._lock:
-            for handle in self._handles.values():
+            handles = list(self._handles.values())
+            for handle in handles:
                 handle.stop.set()
-            return len(self._handles)
+            self._handles.clear()
+            return len(handles)
 
     def snapshot(self) -> dict:
         with self._lock:
             self._reap()
             return {
                 "active": len(self._handles),
-                "limit": self._limit,
+                # null rather than 0, so a reader cannot mistake "no limit"
+                # for "no room".
+                "limit": self._limit if self._limit > 0 else None,
                 "streams": [h.as_dict() for h in self._handles.values()],
             }
 
@@ -183,9 +253,11 @@ class StreamRegistry:
         """
         Expire streams that have outlived the cap. Caller holds the lock.
 
-        Asking first and forcing later: a generator that is merely slow gets a
-        grace period to exit and release itself, so the count does not briefly
-        exceed the limit. Only one that ignores the flag is cut loose.
+        This is about abandoned work, not about the budget: a stream nobody is
+        watching still decodes RTSP and, when annotated, still runs the model.
+        Asking first and forcing later gives a generator that is merely slow
+        the chance to exit and tidy up after itself; only one that ignores the
+        flag is cut loose.
         """
         for handle in list(self._handles.values()):
             if handle.age <= self._max_seconds:
@@ -198,7 +270,7 @@ class StreamRegistry:
                 handle.stop.set()
             elif handle.age > self._max_seconds + STREAM_GRACE_SECONDS:
                 logger.error(
-                    "Stream %s on %s did not stop, reclaiming its slot",
+                    "Stream %s on %s did not stop, dropping it from the register",
                     handle.id, handle.ip_address,
                 )
                 self._handles.pop(handle.id, None)
@@ -233,6 +305,11 @@ async def lifespan(_: FastAPI):
     runtime.params = DetectionParams(imgsz=settings.imgsz, device=device, half=half)
     logger.info("Loaded %s on %s (half=%s)", settings.weights, device, half)
     yield
+    # Stop every open stream on the way down, so a reload does not leave
+    # generators holding cameras open against the next process.
+    stopped = runtime.streams.close_all()
+    if stopped:
+        logger.info("Stopped %d stream(s) on shutdown", stopped)
 
 
 # Path prefix this API is mounted under by the reverse proxy. Apache strips it
@@ -256,7 +333,7 @@ CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "CORS_ORIGINS",
-        "https://cosai.nrru.ac.th,https://altosnrru.nrru.ac.th,http://localhost:5173",
+        "https://cosai.nrru.ac.th,https://smartlab.nrru.ac.th,https://altosnrru.nrru.ac.th,http://localhost:5173",
     ).split(",")
     if origin.strip()
 ]
@@ -413,6 +490,8 @@ def mjpeg_frames(
     handle: StreamHandle,
     params: DetectionParams | None,
     fps: float,
+    tiles: int = 1,
+    overlap: float = 0.2,
 ):
     """
     Yield JPEG parts until the client goes away.
@@ -438,7 +517,11 @@ def mjpeg_frames(
                 break
 
             if params is not None:
-                detections = run_detection(frame, params)
+                # Tiled here for the same reason as in /count: a single pass
+                # over a downscaled 1080p frame loses the people at the back of
+                # the room, and boxes that disagree with the count on the card
+                # are worse than no boxes.
+                detections = count_frame(frame, params, tiles, overlap)
                 frame = draw_annotations(frame, detections, f"Count: {len(detections)}")
 
             encoded, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -479,7 +562,7 @@ def grab_still(ip_address: str, warmup: int = 5) -> "cv2.typing.MatLike":
     if handle is None:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many live streams open (limit {MAX_CONCURRENT_STREAMS})",
+            detail=f"Too many live streams open (limit {runtime.streams.limit})",
         )
 
     try:
@@ -593,23 +676,32 @@ def count_camera_annotated(
 @app.get("/stream/{ip_address}")
 def stream_camera(
     ip_address: str,
+    tiles: int = Query(1, ge=1, le=6, description="NxN grid of overlapping crops; 1 disables tiling"),
+    overlap: float = Query(0.2, ge=0.0, le=0.5, description="How much neighbouring tiles overlap"),
     classes: str | None = Query(None),
     confidence: float | None = Query(None, ge=0.0, le=1.0),
     iou: float | None = Query(None, ge=0.0, le=1.0),
     imgsz: int | None = Query(None, ge=32, le=4096),
     fps: float = Query(5.0, gt=0.0, le=30.0, description="Annotated frames per second"),
+    viewer: str = Query("", max_length=64, description="Caller id; replaces that caller's earlier stream"),
 ):
-    """Live MJPEG from one camera, with detections drawn on each frame."""
+    """
+    Live MJPEG from one camera, with detections drawn on each frame.
+
+    fps is a ceiling, not a promise: tiles=3 runs nine detections per frame, so
+    the real rate is whatever the model manages, and asking for more frames
+    than it can produce costs nothing.
+    """
     params = params_for(classes, confidence, iou, imgsz)
 
     # Taken before the camera is opened, and handed to the generator's finally
     # only once the connection succeeded — otherwise a run of unreachable
     # cameras would use up every slot and lock out the working ones.
-    handle = runtime.streams.acquire(ip_address, "annotated")
+    handle = runtime.streams.acquire(ip_address, "annotated", viewer)
     if handle is None:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many live streams open (limit {MAX_CONCURRENT_STREAMS})",
+            detail=f"Too many live streams open (limit {runtime.streams.limit})",
         )
 
     try:
@@ -621,7 +713,7 @@ def stream_camera(
         raise
 
     return StreamingResponse(
-        mjpeg_frames(capture, handle, params, fps),
+        mjpeg_frames(capture, handle, params, fps, tiles, overlap),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -630,6 +722,7 @@ def stream_camera(
 def stream_camera_raw(
     ip_address: str,
     fps: float = Query(10.0, gt=0.0, le=30.0, description="Frames per second to relay"),
+    viewer: str = Query("", max_length=64, description="Caller id; replaces that caller's earlier stream"),
 ):
     """
     Live MJPEG from one camera, straight through — no detection, no boxes.
@@ -637,11 +730,11 @@ def stream_camera_raw(
     Defaults to a higher frame rate than /stream because nothing here waits on
     the model; the only cost is decode and re-encode.
     """
-    handle = runtime.streams.acquire(ip_address, "raw")
+    handle = runtime.streams.acquire(ip_address, "raw", viewer)
     if handle is None:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many live streams open (limit {MAX_CONCURRENT_STREAMS})",
+            detail=f"Too many live streams open (limit {runtime.streams.limit})",
         )
 
     try:
@@ -663,15 +756,18 @@ def view_camera(
     request: Request,
     ip_address: str,
     fps: float = Query(10.0, gt=0, le=30),
+    detect_fps: float = Query(2.0, gt=0, le=30, description="Frame ceiling for the annotated view"),
+    tiles: int = Query(3, ge=1, le=6, description="Tiling used by the annotated view"),
+    overlap: float = Query(0.2, ge=0.0, le=0.5),
 ):
     """
-    A page showing the plain camera, for checking it by eye.
+    A page showing one camera, with or without detection boxes.
 
-    Points at /raw, not /stream: this is for seeing whether the camera is
-    aimed and focused, which boxes and a count only get in the way of. Open
-    /stream/{ip} directly to watch the detections.
+    Opens on the plain view, which is what checking a camera's aim and focus
+    calls for and costs nothing but a decode. The toggle switches to /stream,
+    where every frame goes through the detector.
     """
-    # The browser resolves this src against the public URL, which still carries
+    # The browser resolves these against the public URL, which still carries
     # the prefix Apache stripped before forwarding — so a bare "/stream/..."
     # would 404 on the proxy. root_path is how FastAPI reports that prefix.
     prefix = request.scope.get("root_path", "").rstrip("/")
@@ -689,12 +785,58 @@ def view_camera(
     h1 {{ margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: .02em; }}
     img {{ max-width: 100%; border-radius: 10px; box-shadow: 0 10px 40px rgb(0 0 0 / .45); }}
     p {{ margin: 0; opacity: .7; font-size: .82rem; }}
+    .modes {{ display: flex; gap: .5rem; }}
+    .modes button {{ padding: .4rem .9rem; border: 1px solid #334155; border-radius: 999px;
+                    background: transparent; color: inherit; font: inherit; font-size: .82rem;
+                    cursor: pointer; }}
+    .modes button[aria-pressed="true"] {{ border-color: #38bdf8; background: #0b4a6f; color: #e0f2fe; }}
   </style>
 </head>
 <body>
   <h1>Camera {ip_address}</h1>
-  <img src="{prefix}/raw/{ip_address}?fps={fps}" alt="Live view of camera {ip_address}" />
-  <p>{fps} fps &middot; no detection</p>
+  <div class="modes">
+    <button type="button" data-mode="raw" aria-pressed="true">Plain</button>
+    <button type="button" data-mode="detect" aria-pressed="false">Boxes</button>
+  </div>
+  <img id="feed" alt="Live view of camera {ip_address}" />
+  <p id="note"></p>
+<script>
+  // One id for this page, so switching mode replaces this viewer's stream on
+  // the relay instead of queueing behind it: a dropped MJPEG connection is
+  // only noticed when the next write to it fails.
+  const viewer = "view-" + Math.random().toString(36).slice(2, 12);
+  const prefix = {prefix!r};
+  const ip = {ip_address!r};
+  const feed = document.getElementById("feed");
+  const note = document.getElementById("note");
+  const urls = {{
+    raw: prefix + "/raw/" + encodeURIComponent(ip) + "?fps={fps}&viewer=" + viewer,
+    detect: prefix + "/stream/" + encodeURIComponent(ip)
+            + "?fps={detect_fps}&tiles={tiles}&overlap={overlap}&viewer=" + viewer,
+  }};
+  const notes = {{
+    raw: "{fps} fps \u00b7 no detection",
+    detect: "up to {detect_fps} fps \u00b7 {tiles}\u00d7{tiles} tiled detection",
+  }};
+  function show(mode) {{
+    for (const button of document.querySelectorAll(".modes button")) {{
+      button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
+    }}
+    // Cache-busted so the browser opens a new connection rather than reviving
+    // the closed one.
+    feed.src = urls[mode] + "&t=" + Date.now();
+    note.textContent = notes[mode];
+  }}
+  for (const button of document.querySelectorAll(".modes button")) {{
+    button.addEventListener("click", () => show(button.dataset.mode));
+  }}
+  // Hand the slot back on the way out rather than leaving the relay to notice.
+  addEventListener("pagehide", () => {{
+    fetch(prefix + "/streams/viewer/" + viewer, {{ method: "DELETE", keepalive: true }})
+      .catch(() => {{}});
+  }});
+  show("raw");
+</script>
 </body>
 </html>"""
 
@@ -716,6 +858,23 @@ def close_streams():
     asked = runtime.streams.close_all()
     logger.info("Close requested for %d stream(s)", asked)
     return {"closing": asked, "streams": runtime.streams.snapshot()}
+
+
+@app.delete("/streams/viewer/{viewer}")
+def close_viewer_streams(viewer: str):
+    """
+    Hand back the slots one viewer holds.
+
+    A browser closing an MJPEG connection is only noticed when the next write
+    to it fails, which can take a minute. A page that knows it is done — the
+    modal closing, the tab unloading — can say so here and free the slot at
+    once. Returns 200 even when it held nothing, because the caller is on its
+    way out and has nothing useful to do with an error.
+    """
+    closed = runtime.streams.close_viewer(viewer)
+    if closed:
+        logger.info("Viewer %s released %d stream(s)", viewer, closed)
+    return {"closed": closed}
 
 
 @app.delete("/streams/{stream_id}")
@@ -768,7 +927,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-streams",
         type=int,
         default=MAX_CONCURRENT_STREAMS,
-        help=f"Concurrent stream limit (default: {MAX_CONCURRENT_STREAMS}).",
+        help="Concurrent stream limit; 0 for no limit (default: 0).",
     )
     parser.add_argument(
         "--half",
@@ -823,8 +982,9 @@ if __name__ == "__main__":
     settings.imgsz, settings.half = args.imgsz, args.half
     runtime.streams = StreamRegistry(args.max_streams, args.max_stream_seconds)
     logger.info(
-        "Stream budget: %d concurrent, dropped after %gs",
-        args.max_streams, args.max_stream_seconds,
+        "Streams: %s concurrent, dropped after %gs",
+        args.max_streams if args.max_streams > 0 else "unlimited",
+        args.max_stream_seconds,
     )
 
     scheme = "https" if args.ssl_certfile else "http"

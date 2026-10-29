@@ -99,6 +99,7 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "https://cosai.nrru.ac.th",
+    "https://smartlab.nrru.ac.th",
 ]
 
 # CLIENT_ID = os.getenv('25133f28f9e842998a662eb4b935cf2a')

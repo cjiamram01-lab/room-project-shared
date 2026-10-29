@@ -117,6 +117,10 @@ const API_BASE = (config.apiRoute ?? "http://localhost:8000/").replace(/\/$/, ""
 // its own base URL rather than hanging off the booking API.
 const CAMERA_API_BASE = (config.counterApiRoute ?? "https://altosnrru.nrru.ac.th/counter-api").replace(/\/$/, "");
 const CAMERA_FPS = 5;
+// The annotated view asks for fewer frames because each one goes through the
+// detector. It is a ceiling rather than a rate: with tiling the relay serves
+// whatever the model manages, which on a CPU-only host is about one a second.
+const CAMERA_DETECT_FPS = 2;
 // Stop just short of the relay's own 600s cap. Reaching that cap server-side
 // is worse than stopping early: the relay drops the stream without telling
 // the browser, so the <img> simply freezes on its last frame and keeps
@@ -153,12 +157,25 @@ const roomCameras = ref(new Map<string, string[]>());
 const liveCountRooms = new Set<string>();
 const cameraRoom = ref("");
 const cameraIndex = ref(0);
+// "raw" relays the camera untouched; "detect" runs YOLO and draws a box round
+// each person. Raw is the default: it is the cheaper stream and what someone
+// glancing at a room wants to see.
+const cameraMode = ref<"raw" | "detect">("raw");
 const cameraFailed = ref(false);
 const cameraPaused = ref(false);
 const cameraSecondsLeft = ref(CAMERA_SESSION_SECONDS);
 // Bumped on every resume so the <img> key changes and the browser opens a new
 // connection instead of serving the dead one from cache.
 const cameraAttempt = ref(0);
+// One id for this tab, sent with every stream request. The relay retires this
+// viewer's previous stream when a new one arrives, which matters because a
+// browser dropping an MJPEG connection is only noticed when the next write
+// fails: without it, switching view mode or camera would hold both slots for
+// the best part of a minute. randomUUID needs a secure context, so a plain
+// http:// page falls back to a random string.
+const cameraViewerId = typeof crypto !== "undefined" && "randomUUID" in crypto
+  ? crypto.randomUUID()
+  : `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 const state = ref<LoadState>("loading");
 const errorMessage = ref("");
 const apiStatus = ref<ApiStatus>("checking");
@@ -571,8 +588,20 @@ const cameraIps = computed(() => camerasFor(cameraRoom.value));
 const cameraStreamUrl = computed(() => {
   const ip = cameraIps.value[cameraIndex.value];
   if (!ip) return "";
-  return `${CAMERA_API_BASE}/raw/${encodeURIComponent(ip)}?fps=${CAMERA_FPS}&t=${cameraAttempt.value}`;
+  // t= is not read by the relay. It is there to change the URL on every
+  // attempt, so the browser opens a new connection instead of reviving the
+  // dead one from cache.
+  const base = `${CAMERA_API_BASE}`;
+  const tail = `&viewer=${encodeURIComponent(cameraViewerId)}&t=${cameraAttempt.value}`;
+  if (cameraMode.value === "detect") {
+    // Same tiling as the counts on the cards, so the boxes on screen and the
+    // number beside the room agree.
+    return `${base}/stream/${encodeURIComponent(ip)}`
+      + `?fps=${CAMERA_DETECT_FPS}&tiles=${CAMERA_COUNT_TILES}&overlap=${CAMERA_COUNT_OVERLAP}${tail}`;
+  }
+  return `${base}/raw/${encodeURIComponent(ip)}?fps=${CAMERA_FPS}${tail}`;
 });
+const cameraModeFps = computed(() => (cameraMode.value === "detect" ? CAMERA_DETECT_FPS : CAMERA_FPS));
 const cameraLive = computed(() => Boolean(cameraRoom.value) && !cameraPaused.value && !cameraFailed.value);
 const cameraCountdownLabel = computed(() => {
   const total = Math.max(0, cameraSecondsLeft.value);
@@ -593,12 +622,31 @@ function stopCameraSession() {
   cameraTimer = null;
 }
 
+function releaseCameraSlot() {
+  // Unmounting the <img> drops the connection, but the relay only finds out
+  // when its next write to it fails, which can take the better part of a
+  // minute and leaves a slot spent meanwhile. Telling it outright frees the
+  // slot now. Fire and forget: nothing on screen depends on the answer, and
+  // keepalive lets it survive the page being closed.
+  try {
+    void fetch(`${CAMERA_API_BASE}/streams/viewer/${encodeURIComponent(cameraViewerId)}`, {
+      method: "DELETE",
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    // An older relay has no such route, and a viewer that cannot be released
+    // is reclaimed by the relay's own time cap. Either way, not worth a
+    // message on screen.
+  }
+}
+
 function pauseCamera() {
   // Pausing unmounts the <img>, which is what actually closes the MJPEG
   // connection and hands the slot back. Leaving it mounted would keep the
   // relay's budget spent on a picture nobody is watching.
   stopCameraSession();
   cameraPaused.value = true;
+  releaseCameraSlot();
 }
 
 function resumeCamera() {
@@ -611,6 +659,7 @@ function resumeCamera() {
 function openCamera(roomcode: string, index = 0) {
   cameraRoom.value = roomcode;
   cameraIndex.value = index;
+  cameraMode.value = "raw";
   cameraFailed.value = false;
   cameraPaused.value = false;
   cameraAttempt.value += 1;
@@ -622,10 +671,25 @@ function closeCamera() {
   // MJPEG connection. The relay allows only a handful of concurrent streams,
   // so a modal left holding one would lock other viewers out.
   stopCameraSession();
+  releaseCameraSlot();
   cameraRoom.value = "";
   cameraIndex.value = 0;
+  cameraMode.value = "raw";
   cameraFailed.value = false;
   cameraPaused.value = false;
+}
+
+function setCameraMode(mode: "raw" | "detect") {
+  if (cameraMode.value === mode) return;
+  cameraMode.value = mode;
+  cameraFailed.value = false;
+  cameraPaused.value = false;
+  // Changing the URL remounts the <img>, which closes the old MJPEG
+  // connection and frees its slot before the new one is asked for.
+  cameraAttempt.value += 1;
+  // The clock restarts with the new stream: the cap is there to stop one
+  // viewer holding a slot indefinitely, and this is a different slot.
+  startCameraSession();
 }
 
 function selectCamera(index: number) {
@@ -640,6 +704,9 @@ function handleCameraError() {
   // The stream is already gone, so the countdown has nothing left to protect.
   stopCameraSession();
   cameraFailed.value = true;
+  // Clears whatever this viewer still has registered on the relay, so the
+  // retry starts from nothing rather than adding to it.
+  releaseCameraSlot();
 }
 
 function handleCameraVisibility() {
@@ -1186,6 +1253,9 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleCameraKeydown);
   document.removeEventListener("visibilitychange", handleCameraVisibility);
   stopCameraSession();
+  // Navigating away from the dashboard unmounts the <img> without going
+  // through closeCamera, so the slot has to be handed back here too.
+  if (cameraRoom.value) releaseCameraSlot();
   personCountStream?.close();
   personCountStream = null;
 });
@@ -1816,7 +1886,8 @@ onUnmounted(() => {
           <div>
             <h2 id="camera-modal-title">กล้องห้อง {{ cameraRoom }}</h2>
             <p>
-              {{ cameraIps[cameraIndex] }} &middot; {{ CAMERA_FPS }} fps
+              {{ cameraIps[cameraIndex] }} &middot; {{ cameraModeFps }} fps
+              <template v-if="cameraMode === 'detect'"> &middot; ตีกรอบด้วย AI</template>
               <template v-if="cameraLive"> &middot; เหลือเวลา {{ cameraCountdownLabel }}</template>
             </p>
           </div>
@@ -1824,6 +1895,31 @@ onUnmounted(() => {
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
           </button>
         </header>
+
+        <div class="camera-mode-switch" role="group" aria-label="รูปแบบการแสดงภาพ">
+          <button
+            type="button"
+            :class="{ selected: cameraMode === 'raw' }"
+            :aria-pressed="cameraMode === 'raw'"
+            @click="setCameraMode('raw')"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 7h12v10H3z" /><path d="m15 11 6-3v8l-6-3z" />
+            </svg>
+            ภาพสด
+          </button>
+          <button
+            type="button"
+            :class="{ selected: cameraMode === 'detect' }"
+            :aria-pressed="cameraMode === 'detect'"
+            @click="setCameraMode('detect')"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4" /><rect x="9" y="9" width="6" height="6" rx="1" />
+            </svg>
+            ตีกรอบคน
+          </button>
+        </div>
 
         <div class="camera-stage">
           <!-- v-if, not :src="": removing the element is what actually closes
@@ -1850,7 +1946,7 @@ onUnmounted(() => {
               <path d="M12 3 1.8 20.4h20.4z" /><path d="M12 9.4v4.4" /><path d="M12 16.9h.01" />
             </svg>
             <p>ไม่สามารถแสดงภาพจากกล้องได้</p>
-            <p class="camera-error-hint">กล้องอาจออฟไลน์ หรือมีผู้ชมพร้อมกันเกินจำนวนที่รองรับ</p>
+            <p class="camera-error-hint">กล้องอาจออฟไลน์ หรือเชื่อมต่อไม่ได้ในขณะนี้</p>
             <button type="button" @click="resumeCamera">ลองใหม่</button>
           </div>
         </div>
@@ -2296,6 +2392,13 @@ onUnmounted(() => {
 .camera-paused-hint { max-width: 30ch; opacity: 0.7; font-size: 0.76rem !important; }
 .camera-paused button { margin-top: 0.7rem; min-height: 2.3rem; padding: 0 1.1rem; border: 1px solid var(--dashboard-accent, #2563eb); border-radius: 8px; background: var(--dashboard-accent, #2563eb); color: #fff; font: inherit; font-size: 0.82rem; font-weight: 750; cursor: pointer; }
 .camera-paused button:hover { background: color-mix(in srgb, var(--dashboard-accent, #2563eb) 84%, #000); }
+
+.camera-mode-switch { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.camera-mode-switch button { display: inline-flex; align-items: center; gap: 0.35rem; min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--border, #d7dee8); border-radius: 999px; background: var(--bg-surface, #fff); color: var(--text-secondary, #526174); font: inherit; font-size: 0.78rem; font-weight: 700; cursor: pointer; }
+.camera-mode-switch button:hover { border-color: var(--dashboard-accent, #2563eb); color: var(--dashboard-accent, #2563eb); }
+.camera-mode-switch button:focus-visible { outline: 2px solid var(--dashboard-accent, #2563eb); outline-offset: 2px; }
+.camera-mode-switch button.selected { border-color: var(--dashboard-accent, #2563eb); background: var(--dashboard-accent-soft, #dbeafe); color: var(--dashboard-accent, #2563eb); }
+.camera-mode-switch svg { width: 0.95rem; height: 0.95rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .camera-switcher { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .camera-switcher button { min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--border, #d7dee8); border-radius: 8px; background: var(--bg-surface, #fff); color: var(--text-secondary, #526174); font: inherit; font-size: 0.78rem; font-weight: 700; cursor: pointer; }

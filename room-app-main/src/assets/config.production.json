@@ -1,0 +1,23 @@
+{
+  "mqtt": {
+    "host": "cosai.nrru.ac.th",
+    "port": 443,
+    "protocol": "wss",
+    "path": "/mqtt-ws/",
+    "username": "",
+    "password": "",
+    "reconnectPeriod": 4000,
+    "connectTimeout": 10000
+  },
+  "topics": [
+    "device/+/command",
+    "send_message/qr",
+    "update_schedule",
+    "toggle_popup/popup"
+  ],
+  "bookingUrl": "https://smartlab.nrru.ac.th/room-manager/",
+  "staffAccessUrl": "https://smartlab.nrru.ac.th/room-manager/staff-access/",
+  "prefixUrl": "https://smartlab.nrru.ac.th/room-manager/confirm/",
+  "apiRoute": "https://cosai.nrru.ac.th:8000/",
+  "counterApiRoute": "https://altosnrru.nrru.ac.th/counter-api"
+}

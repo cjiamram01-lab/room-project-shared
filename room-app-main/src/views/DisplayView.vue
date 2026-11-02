@@ -547,6 +547,7 @@ async function installApp() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 onMounted(async () => {
+  document.body.classList.add('display-view-body')
   window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.addEventListener('appinstalled', onAppInstalled)
 
@@ -618,6 +619,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  document.body.classList.remove('display-view-body')
   window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.removeEventListener('appinstalled', onAppInstalled)
   client?.end(true)
@@ -767,7 +769,7 @@ onUnmounted(() => {
 <style scoped>
 * { box-sizing: border-box; }
 
-:global(body) {
+:global(body.display-view-body) {
   margin: 0;
   display: flex;
   justify-content: center;

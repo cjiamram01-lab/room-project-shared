@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { VitePWA } from 'vite-plugin-pwa'
+import { fileURLToPath, URL } from 'node:url'
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   server: {
     proxy: {
       '/api': {
@@ -14,6 +15,15 @@ export default defineConfig({
     },
   },
   plugins: [
+    {
+      name: 'production-config',
+      enforce: 'pre',
+      resolveId(source) {
+        if (command === 'build' && source.endsWith('/assets/config.json')) {
+          return fileURLToPath(new URL('./src/assets/config.production.json', import.meta.url))
+        }
+      },
+    },
     vue(),
     VitePWA({
       registerType: 'autoUpdate',
@@ -40,4 +50,4 @@ export default defineConfig({
       },
     }),
   ],
-})
+}))

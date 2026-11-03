@@ -89,6 +89,11 @@ MAX_STREAM_SECONDS = 600
 # How long after that to wait for the generator to notice before the slot is
 # taken back by force.
 STREAM_GRACE_SECONDS = 15
+# A stream that has not managed a frame in this long is stuck or abandoned.
+# The common case is a client that went away without closing: the generator
+# blocks on a write that never fails, so it never reaches its stop check. A
+# live viewer produces frames continuously, so this does not catch one.
+STREAM_IDLE_SECONDS = 20
 
 # The pair Apache already serves cosai.nrru.ac.th with, so --ssl needs no
 # arguments on the server box.
@@ -109,10 +114,22 @@ class StreamHandle:
     # can take over from this one instead of queueing behind it. Empty when
     # the caller did not send one, which never supersedes anything.
     viewer: str = ""
+    # When this stream last got a frame out. Starts at creation so a stream
+    # that never manages its first frame still ages out.
+    last_frame_at: float = field(default_factory=time.monotonic)
 
     @property
     def age(self) -> float:
         return time.monotonic() - self.started_at
+
+    @property
+    def idle(self) -> float:
+        """Seconds since the last frame went out. The sign of a wedged stream."""
+        return time.monotonic() - self.last_frame_at
+
+    def touch(self) -> None:
+        """Called after each frame, so idle time means what it says."""
+        self.last_frame_at = time.monotonic()
 
     def as_dict(self) -> dict:
         return {
@@ -120,6 +137,7 @@ class StreamHandle:
             "ip_address": self.ip_address,
             "kind": self.kind,
             "age_seconds": round(self.age, 1),
+            "idle_seconds": round(self.idle, 1),
             "stopping": self.stop.is_set(),
             "viewer": self.viewer,
         }
@@ -139,9 +157,11 @@ class StreamRegistry:
     off it whether or not anything is being counted against a limit.
     """
 
-    def __init__(self, limit: int, max_seconds: float = MAX_STREAM_SECONDS):
+    def __init__(self, limit: int, max_seconds: float = MAX_STREAM_SECONDS,
+                 idle_seconds: float = STREAM_IDLE_SECONDS):
         self._limit = limit
         self._max_seconds = max_seconds
+        self._idle_seconds = idle_seconds
         self._lock = threading.Lock()
         self._handles: dict[str, StreamHandle] = {}
 
@@ -157,11 +177,19 @@ class StreamRegistry:
         closing the old one, and a dropped client is only noticed when the
         next write fails — tens of seconds later. Without this, one person
         toggling twice would leave three streams running for one picture.
+
+        A full budget resets rather than refuses: the streams that have gone
+        quiet are dropped, and if every one of them is genuinely live the
+        longest-running is retired to make room. Turning a viewer away
+        because of a stream nobody is watching is the worse outcome, and a
+        budget that can wedge until the time cap is no budget at all.
         """
         with self._lock:
             self._reap()
             if viewer:
                 self._supersede(viewer)
+            if 0 < self._limit <= len(self._handles):
+                self._reset_for_room()
             if 0 < self._limit <= len(self._handles):
                 return None
             handle = StreamHandle(uuid4().hex[:8], ip_address, kind, time.monotonic(), viewer=viewer)
@@ -172,6 +200,47 @@ class StreamRegistry:
     def limit(self) -> int:
         """The configured cap; 0 when there is none."""
         return self._limit
+
+    def _reset_for_room(self) -> None:
+        """
+        Make space for one more stream. Caller holds the lock.
+
+        Quiet streams go first — they are the ones that are stuck or whose
+        client has gone — and only if every stream is producing frames does
+        the oldest get retired. Each one is told to stop and dropped at once,
+        the same way close() does it, so the slot is free now rather than
+        whenever the generator next looks.
+        """
+        quiet = sorted(
+            (h for h in self._handles.values() if h.idle >= self._idle_seconds),
+            key=lambda h: h.idle,
+            reverse=True,
+        )
+        for handle in quiet:
+            logger.warning(
+                "Budget full: dropping stream %s on %s, no frame for %.0fs",
+                handle.id, handle.ip_address, handle.idle,
+            )
+            handle.stop.set()
+            self._handles.pop(handle.id, None)
+            if len(self._handles) < self._limit:
+                return
+
+        if not self._handles or len(self._handles) < self._limit:
+            return
+
+        oldest = max(self._handles.values(), key=lambda h: h.age)
+        logger.warning(
+            "Budget full and every stream is live: retiring the oldest, "
+            "%s on %s after %.0fs",
+            oldest.id, oldest.ip_address, oldest.age,
+        )
+        oldest.stop.set()
+        self._handles.pop(oldest.id, None)
+
+    def reset(self) -> int:
+        """Clear the register outright; reports how many were holding a slot."""
+        return self.close_all()
 
     def _supersede(self, viewer: str) -> None:
         """
@@ -260,6 +329,15 @@ class StreamRegistry:
         flag is cut loose.
         """
         for handle in list(self._handles.values()):
+            if handle.idle > self._idle_seconds + STREAM_GRACE_SECONDS:
+                # Well past merely slow: nothing is reading this one.
+                logger.warning(
+                    "Stream %s on %s has sent nothing for %.0fs, dropping it",
+                    handle.id, handle.ip_address, handle.idle,
+                )
+                handle.stop.set()
+                self._handles.pop(handle.id, None)
+                continue
             if handle.age <= self._max_seconds:
                 continue
             if not handle.stop.is_set():
@@ -533,6 +611,10 @@ def mjpeg_frames(
                 b"Content-Length: " + str(len(buffer)).encode() + b"\r\n\r\n"
                 + buffer.tobytes() + b"\r\n"
             )
+            # Only reached once the frame has actually gone out, which is
+            # what makes idle time a usable signal: a write that blocks
+            # because the client has gone never gets here.
+            handle.touch()
 
             # Throttle to the requested rate. Without this the loop runs every
             # camera frame through YOLO and one viewer saturates the GPU.
@@ -924,6 +1006,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Drop a stream after this long, reclaiming its slot (default: {MAX_STREAM_SECONDS:g}).",
     )
     parser.add_argument(
+        "--max-stream-idle",
+        type=float,
+        default=STREAM_IDLE_SECONDS,
+        help=(f"Treat a stream with no frame for this long as abandoned, and drop it "
+              f"first when the budget is full (default: {STREAM_IDLE_SECONDS:g})."),
+    )
+    parser.add_argument(
         "--max-streams",
         type=int,
         default=MAX_CONCURRENT_STREAMS,
@@ -980,11 +1069,12 @@ if __name__ == "__main__":
     args = parse_args()
     settings.weights, settings.device = args.weights, args.device
     settings.imgsz, settings.half = args.imgsz, args.half
-    runtime.streams = StreamRegistry(args.max_streams, args.max_stream_seconds)
+    runtime.streams = StreamRegistry(
+        args.max_streams, args.max_stream_seconds, args.max_stream_idle)
     logger.info(
-        "Streams: %s concurrent, dropped after %gs",
+        "Streams: %s concurrent, dropped after %gs, idle cutoff %gs",
         args.max_streams if args.max_streams > 0 else "unlimited",
-        args.max_stream_seconds,
+        args.max_stream_seconds, args.max_stream_idle,
     )
 
     scheme = "https" if args.ssl_certfile else "http"

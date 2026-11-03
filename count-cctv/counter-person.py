@@ -634,9 +634,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="auto",
-        help="Where to run YOLO: auto (GPU when available, default), cpu, cuda, "
-        "or a GPU index such as 0.",
+        default="cuda",
+        help="Where to run YOLO: cuda (the default, and required — the run stops "
+        "if there is no GPU), a GPU index such as 0, cpu, or auto to use the GPU "
+        "when there is one and fall back quietly when there is not.",
     )
     parser.add_argument(
         "--half",

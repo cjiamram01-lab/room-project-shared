@@ -121,8 +121,9 @@ def resolve_device(requested: str) -> str:
 
     Ultralytics falls back to the CPU silently when CUDA is missing, so a
     counter that quietly runs ten times slower looks exactly like one that is
-    working. "auto" prefers the GPU; naming a device explicitly makes a missing
-    GPU a loud warning rather than an invisible downgrade.
+    working. "auto" prefers the GPU and warns when it settles for the CPU;
+    naming a GPU ("cuda", "0") means it is required, and a missing one raises
+    rather than downgrading behind your back.
     """
     import torch  # imported here so --help works without loading torch
 
@@ -137,12 +138,22 @@ def resolve_device(requested: str) -> str:
         return f"cuda:{index}"
 
     if wanted_gpu and requested != "auto":
-        # Explicitly asked for a GPU and there is none: worth shouting about.
-        logger.error(
-            "GPU requested but torch reports no CUDA device (torch %s, cuda build %s). "
-            "Falling back to CPU.", torch.__version__, torch.version.cuda,
+        # Naming a GPU is a requirement, not a preference. Falling back to the
+        # CPU here is what made a ten-times-slower counter look healthy for a
+        # whole deployment; refusing to start says so in one line instead.
+        hint = (
+            "pip install --force-reinstall torch torchvision "
+            "--index-url https://download.pytorch.org/whl/cu126"
         )
-    elif wanted_gpu:
+        raise RuntimeError(
+            f"--device {requested} was asked for, but torch reports no CUDA device "
+            f"(torch {torch.__version__}, cuda build {torch.version.cuda}). "
+            f"A '+cpu' torch build has no GPU support whatever the hardware is; "
+            f"install a CUDA build with: {hint}  "
+            f"Use --device auto to run on the CPU instead."
+        )
+
+    if wanted_gpu:
         logger.warning(
             "No CUDA device available (torch %s, cuda build %s) — running on CPU.",
             torch.__version__, torch.version.cuda,
@@ -173,12 +184,30 @@ def load_model(weights: str, device: str = "cpu") -> "YOLO":
         raise RuntimeError(f"Failed to load YOLO model '{weights}': {exc}") from exc
 
 
+def _fp16_argument() -> tuple[str, object]:
+    """
+    How this ultralytics spells "run in half precision".
+
+    8.4 replaced half=True with quantize="fp16"; anything older only has
+    half=. Worked out once at import rather than per call.
+    """
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+    except Exception:
+        return "half", True
+    return ("quantize", "fp16") if "quantize" in DEFAULT_CFG_DICT else ("half", True)
+
+
+_FP16_KEY, _FP16_VALUE = _fp16_argument()
+
+
 def detect(frame, model: YOLO, params: DetectionParams) -> list[Detection]:
     """Every box YOLO finds in one frame, filtered to params.classes."""
-    # half is only passed when it is on: ultralytics 8.4 deprecated the
-    # argument and warns once per call, so always sending half=False filled
-    # the log with a notice about a feature we were not using.
-    extra = {"half": True} if params.half else {}
+    # FP16 is requested as quantize="fp16" on ultralytics 8.4, which
+    # deprecated half= and warns once per call about it — with FP16 on by
+    # default on a GPU, that is a line of log per camera per sample. Older
+    # releases only know half=, so the key is chosen from what is supported.
+    extra = {_FP16_KEY: _FP16_VALUE} if params.half else {}
     results = model.predict(
         frame,
         classes=list(params.classes) if params.classes else None,

@@ -71,7 +71,7 @@ SHARED_WEIGHTS_DIR = SCRIPT_DIR.parent / "face-counter"
 class DetectionParams:
     """Parameters controlling YOLO person detection sensitivity."""
 
-    confidence: float = 0.5  # minimum detection confidence to keep a box
+    confidence: float = 0.25  # minimum detection confidence to keep a box
     iou: float = 0.45        # IoU threshold used for NMS
     imgsz: int = 640         # inference resolution; raise it for distant people
 

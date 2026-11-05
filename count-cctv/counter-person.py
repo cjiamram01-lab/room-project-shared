@@ -592,8 +592,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.5,
-        help="Minimum detection confidence to keep a box (default: 0.5).",
+        default=0.25,
+        help="Minimum detection confidence to keep a box (default: 0.25). Lower "
+        "finds people further from the camera; 0.5 misses most of a full room.",
     )
     parser.add_argument(
         "--iou",

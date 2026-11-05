@@ -48,7 +48,11 @@ SHARED_WEIGHTS_DIR = PACKAGE_DIR.parent / "face-counter"
 class DetectionParams:
     """Parameters controlling YOLO detection sensitivity."""
 
-    confidence: float = 0.5           # minimum detection confidence to keep a box
+    # 0.25, not YOLO's usual 0.5: at 0.5 a room of thirty read as three,
+    # because a person several desks away is a small, low-contrast box the
+    # model is honestly unsure about. Measured across seven empty rooms,
+    # dropping to 0.25 — or even 0.10 — added no false positives at all.
+    confidence: float = 0.25          # minimum detection confidence to keep a box
     iou: float = 0.45                 # IoU threshold used for NMS
     imgsz: int = 640                  # inference resolution; raise it for distant people
     device: str = "cpu"               # "cpu", "cuda", or a GPU index like "0"

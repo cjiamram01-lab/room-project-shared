@@ -121,7 +121,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--classes", default=None,
         help="Names or ids, comma separated; 'all' for every class (default: person).",
     )
-    parser.add_argument("--confidence", type=float, default=0.5, help="Minimum confidence (default: 0.5).")
+    parser.add_argument("--confidence", type=float, default=0.25, help="Minimum confidence (default: 0.25).")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold (default: 0.45).")
     parser.add_argument("--imgsz", type=int, default=640, help="Inference resolution (default: 640).")
     parser.add_argument(
